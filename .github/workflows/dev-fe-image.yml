@@ -40,21 +40,30 @@ jobs:
       contents: read
       packages: write
     steps:
+      # Context values go through env rather than being interpolated into the
+      # script body: a ${{ }} expansion inside run: is substituted before the
+      # shell sees it, so anything caller-controlled is a shell injection.
       - name: Resolve ref and tags
         id: vars
+        env:
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          REF="${{ github.event.inputs.ref }}"
+          REF="$INPUT_REF"
           if [ -z "$REF" ]; then
-            REF="${{ github.sha }}"
-            BRANCH="${{ github.ref_name }}"
+            REF="$HEAD_SHA"
+            BRANCH="$REF_NAME"
           else
             BRANCH="$REF"
           fi
           # Branch names may contain / and other characters a tag cannot hold.
           SLUG=$(echo "$BRANCH" | tr -c 'a-zA-Z0-9_.-' '-' | sed 's/-*$//' | cut -c1-100)
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
-          echo "sha=${REF:0:12}" >> "$GITHUB_OUTPUT"
+          {
+            echo "ref=$REF"
+            echo "slug=$SLUG"
+            echo "sha=${REF:0:12}"
+          } >> "$GITHUB_OUTPUT"
 
       # Only the build context is needed. The Dockerfile clones siterm itself
       # from GitHub at build time, so this repo is never checked out.
@@ -64,6 +73,8 @@ jobs:
           repository: groundsada/siterm-startup
           ref: master
           path: siterm-startup
+          # Do not leave the token in .git/config afterwards.
+          persist-credentials: false
 
       - name: Set up buildx
         uses: docker/setup-buildx-action@v3
@@ -113,14 +124,18 @@ jobs:
           echo "Dispatched deploy for ${IMAGE}:${TAG}"
 
       - name: Summary
+        env:
+          SHA_TAG: ${{ steps.vars.outputs.sha }}
+          SLUG_TAG: ${{ steps.vars.outputs.slug }}
+          BUILT_REF: ${{ steps.vars.outputs.ref }}
         run: |
           {
             echo "### FE image"
             echo ""
             echo '```'
-            echo "${IMAGE}:${{ steps.vars.outputs.sha }}"
-            echo "${IMAGE}:${{ steps.vars.outputs.slug }}"
+            echo "${IMAGE}:${SHA_TAG}"
+            echo "${IMAGE}:${SLUG_TAG}"
             echo '```'
             echo ""
-            echo "built from \`${{ steps.vars.outputs.ref }}\`"
+            echo "built from \`${BUILT_REF}\`"
           } >> "$GITHUB_STEP_SUMMARY"
