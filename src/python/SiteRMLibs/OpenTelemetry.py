@@ -46,7 +46,14 @@ def init_otel(service_name):
     trace.set_tracer_provider(provider)
 
     if os.getenv("OTLP_ENDPOINT"):
-        exporter = OTLPSpanExporter(endpoint=os.getenv("OTLP_ENDPOINT"), insecure=True)
+        # Tempo/Loki/Mimir are multi-tenant and keyed on X-Scope-OrgID. Carry the
+        # tenant as an OTLP header so spans land in the right tenant instead of
+        # being rejected as "no tenant ID".
+        headers = {}
+        tenant = os.getenv("OTLP_TENANT")
+        if tenant:
+            headers["x-scope-orgid"] = tenant
+        exporter = OTLPSpanExporter(endpoint=os.getenv("OTLP_ENDPOINT"), insecure=True, headers=headers)
         span_processor = BatchSpanProcessor(exporter)
     else:
         exporter = ConsoleSpanExporter()
