@@ -4,6 +4,7 @@ import os
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import (
@@ -51,3 +52,8 @@ def init_otel(service_name):
         exporter = ConsoleSpanExporter()
         span_processor = SimpleSpanProcessor(exporter)
     provider.add_span_processor(span_processor)
+
+    # Outbound propagation. SiteRM talks to agents, other frontends and the
+    # orchestrator over httpx; without this no traceparent header is sent and
+    # every service starts its own disconnected trace.
+    HTTPXClientInstrumentor().instrument()
