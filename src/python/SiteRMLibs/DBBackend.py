@@ -46,6 +46,21 @@ def loadEnvFile(filepath="/etc/environment"):
         print(f"Failed loading env file {filepath}. Error: {ex}. Trace: {exc}")
 
 
+def otelEnabled() -> bool:
+    """Whether tracing is enabled. Accepts either gate name, matching
+    SiteRMLibs.OpenTelemetry.otelEnabled and MainUtilities.envBool semantics.
+
+    Duplicated rather than imported: SiteRMLibs.OpenTelemetry imports
+    MainUtilities, and MainUtilities imports dbinterface from this module, so a
+    top-level import here would be circular.
+    """
+    for name in ("OPENTELEMETRY_ENABLED", "OTEL_ENABLED"):
+        val = os.getenv(name)
+        if val is not None and val.strip('"').strip("'").lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
 def buildDatabaseURL() -> str:
     """
     Build SQLAlchemy DATABASE_URL for MariaDB/MySQL.
@@ -89,6 +104,25 @@ class DBBackend:
         self.autocommit = os.getenv("MARIA_DB_AUTOCOMMIT", "True") in ("True", "true", "1")
         self.engine = create_engine(self.database_url, pool_pre_ping=True, future=True)
         self.Session = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        self._instrumentOtel()
+
+    def _instrumentOtel(self):
+        """Attach OpenTelemetry to this engine so DB time shows up inside
+        request and daemon-run spans. Scoped to this engine rather than global,
+        so nothing is patched when tracing is off.
+
+        Never allowed to break the database: a telemetry import or version
+        problem must not stop SiteRM from talking to MariaDB.
+        """
+        if not otelEnabled():
+            return
+        try:
+            # Imported here, not at module scope: see otelEnabled() above.
+            from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+            SQLAlchemyInstrumentor().instrument(engine=self.engine)
+        except Exception as ex:
+            print(f"OpenTelemetry SQLAlchemy instrumentation skipped. Error: {ex}")
 
     @contextmanager
     def session(self):

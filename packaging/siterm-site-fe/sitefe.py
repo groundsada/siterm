@@ -21,7 +21,7 @@ from SiteFE.REST.Model import router as model_router
 from SiteFE.REST.Monitoring import router as monitoring_router
 from SiteFE.REST.Service import router as service_router
 from SiteFE.REST.Topo import router as topo_router
-from SiteRMLibs.MainUtilities import loadEnvFile
+from SiteRMLibs.MainUtilities import envBool, loadEnvFile
 from SiteRMLibs.OpenTelemetry import init_otel, otelEnabled
 
 loadEnvFile()
@@ -29,6 +29,13 @@ loadEnvFile()
 app = FastAPI()
 
 OTEL_ENABLED = otelEnabled()
+
+# Request bodies are deltas -- topology and configuration -- so they are not
+# exported by default. Enabling this also makes the middleware consume the
+# request stream, which BaseHTTPMiddleware buffers in full; that path is only
+# worth taking when someone is actively debugging.
+OTEL_CAPTURE_BODY = envBool("OPENTELEMETRY_DEBUG", False)
+OTEL_BODY_MAXLEN = int(os.getenv("OTEL_BODY_MAXLEN", "1024"))
 
 if OTEL_ENABLED:
     init_otel("siterm-site-fe")
@@ -84,13 +91,14 @@ async def observability_middleware(request: Request, call_next):
         span.set_attribute("http.client_ip", request.client.host if request.client else "unknown")
 
         try:
-            # capture request body (optional)
-            body = await request.body()
-            if body:
-                try:
-                    span.set_attribute("http.request.body", body.decode("utf-8")[:4096])
-                except Exception:
-                    span.set_attribute("http.request.body", "<binary>")
+            # capture request body (optional, debug only -- see OTEL_CAPTURE_BODY)
+            if OTEL_CAPTURE_BODY:
+                body = await request.body()
+                if body:
+                    try:
+                        span.set_attribute("http.request.body", body.decode("utf-8")[:OTEL_BODY_MAXLEN])
+                    except Exception:
+                        span.set_attribute("http.request.body", "<binary>")
 
             response = await call_next(request)
 
