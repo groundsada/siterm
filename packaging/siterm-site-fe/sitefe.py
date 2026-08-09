@@ -21,14 +21,14 @@ from SiteFE.REST.Model import router as model_router
 from SiteFE.REST.Monitoring import router as monitoring_router
 from SiteFE.REST.Service import router as service_router
 from SiteFE.REST.Topo import router as topo_router
-from SiteRMLibs.MainUtilities import envBool, loadEnvFile
-from SiteRMLibs.OpenTelemetry import init_otel
+from SiteRMLibs.MainUtilities import loadEnvFile
+from SiteRMLibs.OpenTelemetry import init_otel, otelEnabled
 
 loadEnvFile()
 
 app = FastAPI()
 
-OTEL_ENABLED = envBool("OTEL_ENABLED", False)
+OTEL_ENABLED = otelEnabled()
 
 if OTEL_ENABLED:
     init_otel("siterm-site-fe")

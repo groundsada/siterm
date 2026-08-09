@@ -16,12 +16,23 @@ from SiteRMLibs import __version__
 from SiteRMLibs.MainUtilities import envBool, loadEnvFile
 
 loadEnvFile()
-OTEL_ENABLED = envBool("OPENTELEMETRY_ENABLED", False)
+
+
+def otelEnabled():
+    """Check whether tracing is enabled.
+
+    Both names are accepted. OPENTELEMETRY_ENABLED gated init_otel while
+    OTEL_ENABLED gated the FastAPI app, and neither aliased the other, so
+    setting only one left tracing half-configured: either a provider with
+    nothing instrumenting it, or spans created against a no-op provider and
+    silently never exported.
+    """
+    return envBool("OPENTELEMETRY_ENABLED", False) or envBool("OTEL_ENABLED", False)
 
 
 def init_otel(service_name):
     """Initializes OpenTelemetry tracing with the given service name."""
-    if not OTEL_ENABLED:
+    if not otelEnabled():
         return
 
     if isinstance(trace.get_tracer_provider(), TracerProvider):
