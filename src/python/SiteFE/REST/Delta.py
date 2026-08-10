@@ -408,6 +408,10 @@ async def submitDelta(
     with TRACER.start_as_current_span("delta.persist") as pspan:
         pspan.set_attribute("delta.model_id", str(item.modelId))
         pspan.set_attribute("delta.traceparent", outContent["traceparent"])
+        # Identity comes from the AUTHENTICATED principal (JWT subject), never
+        # from the unauthenticated sense-request-* headers (#2).
+        if deps.get("user", {}).get("user_info", {}).get("sub"):
+            pspan.set_attribute("user.sub", deps["user"]["user_info"]["sub"])
         saveContent(fname, outContent)
         _record_delta_action(deps["dbI"], deps["user"]["user_info"]["sub"], item.id, "submit", _extract_sense_headers(request))
 

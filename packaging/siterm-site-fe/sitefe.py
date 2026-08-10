@@ -41,7 +41,7 @@ if OTEL_ENABLED:
     init_otel("siterm-site-fe")
     FastAPIInstrumentor.instrument_app(
         app,
-        http_capture_headers_server_request=["user-agent", "if-modified-since", "accept", "sense-request-host", "sense-request-email", "sense-request-fullname", "sense-request-organization"],
+        http_capture_headers_server_request=["user-agent", "if-modified-since", "accept"],
         http_capture_headers_server_response=["content-type", "content-length", "cache-control"],
     )
 
