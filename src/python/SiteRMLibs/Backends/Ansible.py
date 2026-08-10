@@ -19,9 +19,25 @@ import traceback
 
 import ansible_runner
 import yaml
+from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import (
+    TraceContextTextMapPropagator,
+)
 from SiteRMLibs.Backends import parsers
 from SiteRMLibs.CustomExceptions import ConfigException
 from SiteRMLibs.MainUtilities import getLoggingObject, withTimeout
+
+_ansible_tracer = trace.get_tracer("siterm.ansible")
+_trace_propagator = TraceContextTextMapPropagator()
+
+
+def _traceparent():
+    """Current W3C traceparent (trace-id, span-id, flags) for the active span,
+    or empty when no span is active. Handed to ansible_runner's subprocess so a
+    child can correlate back into this daemon's trace."""
+    carrier = {}
+    _trace_propagator.inject(carrier)
+    return carrier.get("traceparent", "")
 
 
 class Switch:
@@ -122,37 +138,55 @@ class Switch:
         # As we might be running multiple workers, we need to make sure
         # cleanup process is done correctly.
         retryCount = self.config.getint("ansible", "ansible_runtime_retry")
-        while retryCount > 0:
-            try:
-                ansOut = ansible_runner.run(
-                    private_data_dir=self.config.get("ansible", "private_data_dir" + subitem),
-                    inventory=self.config.get("ansible", "inventory" + subitem),
-                    playbook=playbook,
-                    rotate_artifacts=self._getRotateArtifacts(playbook, subitem),
-                    debug=self.config.getboolean("ansible", "debug" + subitem),
-                    verbosity=self.__getVerbosity(subitem),
-                    ignore_logging=self.config.getboolean("ansible", "ignore_logging" + subitem),
-                    envvars={
-                        "ANSIBLE_RUNNER_IDLE_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_idle_timeout")),
-                        "ANSIBLE_RUNNER_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_job_timeout")),
-                    },
-                )
-                self.__logAnsibleOutput(ansOut)
-                return ansOut
-            except FileNotFoundError as ex:
-                self.logger.error(f"Ansible playbook got FileNotFound (usually cleanup. Will retry in 5sec): {ex}")
-                self.logger.debug(f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}")
-                retryCount -= 1
-                time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
-            except Exception as ex:
-                self.logger.error(f"Ansible playbook got unexpected Exception: {ex}")
-                self.logger.debug(
-                    f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}",
-                    exc_info=True,
-                )
-                self.logger.debug(f"Full traceback: {traceback.format_exc()}")
-                retryCount -= 1
-                time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+        # ansible_runner runs a subprocess, which severs the OTel context chain
+        # (this is the "ansible boundary" of #6). Wrap the run in a child span
+        # so each ansible invocation still nests under the daemon poll span, and
+        # hand the parent trace context to the subprocess via env so its own
+        # stdout instrumentation can correlate if present.
+        with _ansible_tracer.start_as_current_span(
+            f"ansible.{playbook}",
+            attributes={
+                "ansible.playbook": playbook,
+                "ansible.hosts": hosts or "",
+                "ansible.subitem": subitem,
+            },
+        ) as ans_span:
+            while retryCount > 0:
+                try:
+                    ansOut = ansible_runner.run(
+                        private_data_dir=self.config.get("ansible", "private_data_dir" + subitem),
+                        inventory=self.config.get("ansible", "inventory" + subitem),
+                        playbook=playbook,
+                        rotate_artifacts=self._getRotateArtifacts(playbook, subitem),
+                        debug=self.config.getboolean("ansible", "debug" + subitem),
+                        verbosity=self.__getVerbosity(subitem),
+                        ignore_logging=self.config.getboolean("ansible", "ignore_logging" + subitem),
+                        envvars={
+                            "ANSIBLE_RUNNER_IDLE_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_idle_timeout")),
+                            "ANSIBLE_RUNNER_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_job_timeout")),
+                            # Best-effort: let ansible's own processes see the
+                            # parent trace so remote logs could correlate.
+                            "TRACEPARENT": _traceparent(),
+                        },
+                    )
+                    self.__logAnsibleOutput(ansOut)
+                    ans_span.set_attribute("ansible.rc", getattr(ansOut, "rc", -1))
+                    return ansOut
+                except FileNotFoundError as ex:
+                    self.logger.error(f"Ansible playbook got FileNotFound (usually cleanup. Will retry in 5sec): {ex}")
+                    self.logger.debug(f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}")
+                    retryCount -= 1
+                    time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+                except Exception as ex:
+                    self.logger.error(f"Ansible playbook got unexpected Exception: {ex}")
+                    self.logger.debug(
+                        f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}",
+                        exc_info=True,
+                    )
+                    self.logger.debug(f"Full traceback: {traceback.format_exc()}")
+                    ans_span.record_exception(ex)
+                    retryCount -= 1
+                    time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
         raise Exception("Ansible playbook execution failed after 3 retries. Check logs for more details.")
 
     def getAnsNetworkOS(self, host, subitem=""):
