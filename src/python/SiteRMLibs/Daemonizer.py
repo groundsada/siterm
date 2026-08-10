@@ -18,6 +18,7 @@ import tracemalloc
 
 import psutil
 from deepdiff import DeepDiff
+from opentelemetry import trace
 from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from SiteRMLibs import __version__ as runningVersion
 from SiteRMLibs.CustomExceptions import (
@@ -45,6 +46,13 @@ from SiteRMLibs.MainUtilities import (
     timeout,
 )
 from SiteRMLibs.OpenTelemetry import init_otel
+
+# The daemon-services root tracer. Each poll cycle of every SiteRM service
+# (DBWorker, PolicyService, SNMPMonitoring, ...) runs through Daemonizer.run(),
+# so a span here becomes the root that the LoggingInstrumentor's trace_id
+# attaches to -- turning the previously inert trace_id=0 log lines into
+# correlatable ones (#6 / #10).
+_daemon_tracer = trace.get_tracer("siterm.daemonizer")
 
 
 def getParser(description):
@@ -665,30 +673,48 @@ class Daemon(DBBackend):
                     stwork = int(getUTCnow())
                     refresh = self.autoRefreshDB(**{"sitename": sitename})
                     self.logger.debug("Start worker for %s site", sitename)
-                    try:
-                        self.preRunThread(sitename, rthread)
-                        with timeout(180):
-                            speedup = self.__run(rthread)
-                        self.reporter("OK", sitename, stwork)
-                    except ServiceWarning as ex:
-                        exc = traceback.format_exc()
-                        self.reporter("WARNING", sitename, stwork, str(ex))
-                        self.logger.warning("Service Warning!!! Error details:  %s", ex)
-                        self.logger.warning("Service Warning!!! Traceback details:  %s", exc)
-                        self.logger.warning("It is not fatal error. Continue to run normally.")
-                    except HTTPServerNotReady as ex:
-                        exc = traceback.format_exc()
-                        self.logger.error("HTTP Server Not Ready!!! Error details:  %s", ex)
-                        self.logger.error("HTTP Server Not Ready!!! Traceback details:  %s", exc)
-                        self.logger.error("Look at SiteRM Frontend logs for more details.")
-                    except Exception as ex:
-                        hadFailure = True
-                        self.reporter("FAILED", sitename, stwork, str(ex))
-                        exc = traceback.format_exc()
-                        self.logger.critical(f"Exception!!! Error details:  {ex}. Traceback details: {exc}")
-                    finally:
-                        self.postRunThread(sitename, rthread)
-                        self.logger.debug("Finished worker for %s site", sitename)
+                    # Root span for this site's poll cycle. This is the span the
+                    # LoggingInstrumentor records trace_id from, so each poll is
+                    # one trace with the worker's spans nested under it.
+                    with _daemon_tracer.start_as_current_span(
+                        f"{self.component}.{sitename}.poll",
+                        attributes={
+                            "sitename": sitename,
+                            "service.name": self.component,
+                            "run.count": self.runCount + 1,
+                        },
+                    ) as poll_span:
+                        try:
+                            self.preRunThread(sitename, rthread)
+                            with timeout(180):
+                                speedup = self.__run(rthread)
+                            self.reporter("OK", sitename, stwork)
+                            poll_span.set_status(trace.Status(trace.StatusCode.OK))
+                        except ServiceWarning as ex:
+                            exc = traceback.format_exc()
+                            self.reporter("WARNING", sitename, stwork, str(ex))
+                            self.logger.warning("Service Warning!!! Error details:  %s", ex)
+                            self.logger.warning("Service Warning!!! Traceback details:  %s", exc)
+                            self.logger.warning("It is not fatal error. Continue to run normally.")
+                            poll_span.set_attribute("poll.status", "warning")
+                            poll_span.record_exception(ex)
+                        except HTTPServerNotReady as ex:
+                            exc = traceback.format_exc()
+                            self.logger.error("HTTP Server Not Ready!!! Error details:  %s", ex)
+                            self.logger.error("HTTP Server Not Ready!!! Traceback details:  %s", exc)
+                            self.logger.error("Look at SiteRM Frontend logs for more details.")
+                            poll_span.set_attribute("poll.status", "notready")
+                            poll_span.record_exception(ex)
+                        except Exception as ex:
+                            hadFailure = True
+                            self.reporter("FAILED", sitename, stwork, str(ex))
+                            exc = traceback.format_exc()
+                            self.logger.critical(f"Exception!!! Error details:  {ex}. Traceback details: {exc}")
+                            poll_span.set_status(trace.Status(trace.StatusCode.ERROR, str(ex)))
+                            poll_span.record_exception(ex)
+                        finally:
+                            self.postRunThread(sitename, rthread)
+                            self.logger.debug("Finished worker for %s site", sitename)
                 if self.runLoop():
                     time.sleep(self.sleepTimers["ok"] // 2 if speedup else self.sleepTimers["ok"])
             except KeyboardInterrupt as ex:
