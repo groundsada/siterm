@@ -25,6 +25,7 @@ from fastapi import (
     status,
 )
 from opentelemetry import trace
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from pydantic import BaseModel, constr
 from SiteFE.REST.dependencies import (
     DEFAULT_RESPONSES,
@@ -61,6 +62,17 @@ from SiteRMLibs.MainUtilities import (
 router = APIRouter()
 
 TRACER = trace.get_tracer("siterm.delta")
+
+_trace_propagator = TraceContextTextMapPropagator()
+
+
+def _traceparent():
+    """Current W3C traceparent for the active span (empty if none). Persisted
+    with a delta so the async PolicyService consumer can link back (#4)."""
+    carrier = {}
+    _trace_propagator.inject(carrier)
+    return carrier.get("traceparent", "")
+
 
 startupConfig = getstartupconfig()
 
@@ -374,6 +386,11 @@ async def submitDelta(
         "content": item.dict(),
         "State": "accepting",
         "modelId": item.modelId,
+        # Persist the W3C traceparent of the submitting request so the async
+        # consumer (PolicyService daemon, a SEPARATE process and poll span) can
+        # link its work back to this trace (#4). Without this the delta work
+        # shows up as an orphan under PolicyService's own poll root.
+        "traceparent": _traceparent(),
     }
     # Save item to disk
     fname = os.path.join(
@@ -390,6 +407,7 @@ async def submitDelta(
     )
     with TRACER.start_as_current_span("delta.persist") as pspan:
         pspan.set_attribute("delta.model_id", str(item.modelId))
+        pspan.set_attribute("delta.traceparent", outContent["traceparent"])
         saveContent(fname, outContent)
         _record_delta_action(deps["dbI"], deps["user"]["user_info"]["sub"], item.id, "submit", _extract_sense_headers(request))
 
