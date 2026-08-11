@@ -60,6 +60,10 @@ jobs:
             echo "ref=$REF"
             echo "slug=$SLUG"
             echo "sha=${REF:0:12}"
+            # The agent Dockerfile clones with `git clone -b $GITBR`, and -b
+            # only accepts a branch or tag -- a commit SHA fails with
+            # "Remote branch <sha> not found in upstream origin".
+            echo "gitbr=$BRANCH"
           } >> "$GITHUB_OUTPUT"
 
       # Only the build context is needed. The Dockerfile clones siterm itself
@@ -99,7 +103,7 @@ jobs:
             RELEASE=${{ env.RELEASE }}
             GITORG=groundsada
             GITREPO=siterm
-            GITBR=${{ steps.vars.outputs.ref }}
+            GITBR=${{ steps.vars.outputs.gitbr }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
