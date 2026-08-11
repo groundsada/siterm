@@ -1,0 +1,121 @@
+---
+# Builds a SiteRM Agent image from whatever was just pushed, so the agents in
+# sense-dev run the same instrumented code as the frontends. #14.
+#
+# Same split as dev-fe-image.yml: the build lives in the public fork because
+# Actions minutes are free here, while internal-sense-stack is private and only
+# runs the apply. This one does not dispatch a deploy -- the FE build already
+# does, and two dispatches for one push would race on the same namespace.
+name: dev agent image
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Commit SHA, branch or tag to build'
+        required: false
+        default: ''
+
+concurrency:
+  group: dev-agent-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/groundsada/siterm-agent
+  RELEASE: latest
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Context values go through env rather than being interpolated into the
+      # script body: a ${{ }} expansion inside run: is substituted before the
+      # shell sees it, so anything caller-controlled is a shell injection.
+      - name: Resolve ref and tags
+        id: vars
+        env:
+          INPUT_REF: ${{ github.event.inputs.ref }}
+          HEAD_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          REF="$INPUT_REF"
+          if [ -z "$REF" ]; then
+            REF="$HEAD_SHA"
+            BRANCH="$REF_NAME"
+          else
+            BRANCH="$REF"
+          fi
+          # Branch names may contain / and other characters a tag cannot hold.
+          SLUG=$(echo "$BRANCH" | tr -c 'a-zA-Z0-9_.-' '-' | sed 's/-*$//' | cut -c1-100)
+          {
+            echo "ref=$REF"
+            echo "slug=$SLUG"
+            echo "sha=${REF:0:12}"
+          } >> "$GITHUB_OUTPUT"
+
+      # Only the build context is needed. The Dockerfile clones siterm itself
+      # from GitHub at build time, so this repo is never checked out.
+      - name: Checkout siterm-startup
+        uses: actions/checkout@v4
+        with:
+          repository: groundsada/siterm-startup
+          ref: master
+          path: siterm-startup
+          # Do not leave the token in .git/config afterwards.
+          persist-credentials: false
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # el10 matches the tag the agent helm chart resolves to by default.
+      - name: Build and push agent image
+        uses: docker/build-push-action@v6
+        with:
+          context: siterm-startup/agent/container-build-files
+          file: siterm-startup/agent/container-build-files/Dockerfile-el10
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.sha }}
+            ${{ env.IMAGE }}:${{ steps.vars.outputs.slug }}
+          build-args: |
+            RELEASE=${{ env.RELEASE }}
+            GITORG=groundsada
+            GITREPO=siterm
+            GITBR=${{ steps.vars.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          SHA_TAG: ${{ steps.vars.outputs.sha }}
+          SLUG_TAG: ${{ steps.vars.outputs.slug }}
+          BUILT_REF: ${{ steps.vars.outputs.ref }}
+        run: |
+          {
+            echo "### Agent image"
+            echo ""
+            echo '```'
+            echo "${IMAGE}:${SHA_TAG}"
+            echo "${IMAGE}:${SLUG_TAG}"
+            echo '```'
+            echo ""
+            echo "built from \`${BUILT_REF}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
