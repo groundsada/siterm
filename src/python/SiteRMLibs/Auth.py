@@ -117,7 +117,11 @@ def load_cert_info(cert):
     out["subject"] = name_to_openssl(cert.subject)
     out["notBefore"] = int(cert.not_valid_before_utc.timestamp())
     out["notAfter"] = int(cert.not_valid_after_utc.timestamp())
-    out["fullDN"] = f"{out['issuer']}{out['subject']}"
+    # fullDN is issuer + subject so a CA-issued leaf yields the chain DN. For a
+    # self-signed cert (issuer == subject) concatenating them doubles the DN and
+    # never matches the single full_dn configured for the m2m credential. When
+    # they are equal just use the subject. #14.
+    out["fullDN"] = out["subject"] if out["issuer"] == out["subject"] else f"{out['issuer']}{out['subject']}"
     return out
 
 
