@@ -10,17 +10,17 @@ name: dev agent image
 
 on:
   push:
-    branches: ['**']
+    branches: ["**"]
     paths-ignore:
-      - '**.md'
-      - 'LICENSE'
-      - '.github/workflows/**'
+      - "**.md"
+      - "LICENSE"
+      - ".github/workflows/**"
   workflow_dispatch:
     inputs:
       ref:
-        description: 'Commit SHA, branch or tag to build'
+        description: "Commit SHA, branch or tag to build"
         required: false
-        default: ''
+        default: ""
 
 concurrency:
   group: dev-agent-image-${{ github.ref }}
