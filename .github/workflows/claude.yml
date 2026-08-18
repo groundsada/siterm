@@ -60,7 +60,10 @@ jobs:
           # and nothing here bills Anthropic.
           anthropic_api_key: ${{ secrets.NRP_AUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          use_sticky_comment: true
+          # No use_sticky_comment: verified a no-op here. It finds the comment to
+          # update by looking for claude[bot], but authenticating with
+          # GITHUB_TOKEN posts as github-actions[bot], so every run appends a new
+          # comment regardless. Setting it would just imply behaviour we do not get.
 
           # Read, reason, comment. No Edit/Write/push.
           claude_args: |
