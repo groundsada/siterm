@@ -10,3 +10,19 @@
 [![CodeFactor](https://www.codefactor.io/repository/github/sdn-sense/siterm/badge)](https://www.codefactor.io/repository/github/sdn-sense/siterm)
 
 
+
+## Endpoint pool exhaustion (draft note)
+
+The allocator takes an IPv6 /64 from the SENSE-O pool and marks the row
+allocated. On exhaustion it raises and the request goes to FAILED:
+
+```python
+def allocate(self, site):
+    ep = self.db.query(Endpoint).filter_by(site=site).first()
+    if ep.is_allocated:
+        raise ValueError("already in use")
+    ep.is_allocated = True
+    return ep
+```
+
+Cleanup swallows its own failures at DEBUG, so leaks accumulate silently.
