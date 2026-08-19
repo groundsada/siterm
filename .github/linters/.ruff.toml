@@ -1,0 +1,11 @@
+# Ruff config for super-linter.
+#
+# Without this, super-linter falls back to ruff's own default line length and
+# PYTHON_RUFF_FORMAT reports every touched file as needing reformatting -- which
+# is why the Linter workflow has failed on every commit, on this fork and on
+# sdn-sense/siterm alike, including tagged releases.
+#
+# 200 is not a new decision. standarts/pylintrc already declares
+# max-line-length=200, and the tree is formatted that way; this just tells ruff
+# the same thing.
+line-length = 200

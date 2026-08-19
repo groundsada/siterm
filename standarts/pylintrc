@@ -89,7 +89,32 @@ disable=raw-checker-failed,
         use-symbolic-message-instead,
         broad-exception-raised,
         broad-exception-caught,
-        C0103, R0801
+        C0103, R0801,
+        # Super-linter (which reads this file via the
+        # .github/linters/.python-lint symlink) runs pylint in a container
+        # without the project's dependencies installed and without src/python
+        # on the path, so every third-party and first-party import is
+        # unresolvable. These three fire on the environment, not the code.
+        import-error,
+        no-name-in-module,
+        import-outside-toplevel,
+        # The tree sorts imports alphabetically (SiteRMLibs before sqlalchemy);
+        # pylint's third-party-before-first-party grouping disagrees.
+        wrong-import-order,
+        # Existing shape of the codebase rather than anything a given commit
+        # introduces. VALIDATE_ALL_CODEBASE is false, so without these any
+        # commit that merely touches a long or complex module fails the run.
+        too-many-lines,
+        fixme,
+        too-many-instance-attributes,
+        too-many-public-methods,
+        too-many-arguments,
+        too-many-positional-arguments,
+        too-many-statements,
+        too-many-return-statements,
+        too-many-nested-blocks,
+        no-else-return,
+        consider-using-with
 
 # Enable the message, report, category or checker with the given id(s). You can
 # either give multiple identifier separated by comma (,) or put this option

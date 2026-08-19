@@ -92,7 +92,13 @@ class _NoOpSpan:
 
 
 class _NoOpTracer:
-    """Mirrors the slice of the Tracer API SiteRM uses."""
+    """Mirrors the slice of the Tracer API SiteRM uses.
+
+    One public method is the whole point, and the arguments are accepted and
+    discarded so callers need no branching.
+    """
+
+    # pylint: disable=too-few-public-methods,unused-argument
 
     def start_as_current_span(self, *args, **kwargs):
         """Return a context manager yielding a no-op span."""
