@@ -17,7 +17,6 @@ from SiteRMLibs.OtelWrapper import OTEL_AVAILABLE, envBool, otelEnabled
 try:  # pragma: no cover - import guard, see module docstring
     from opentelemetry import trace
     from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import (
@@ -89,7 +88,25 @@ def init_otel(service_name):
         span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
     provider.add_span_processor(span_processor)
 
-    # Outbound propagation. SiteRM talks to agents, other frontends and the
-    # orchestrator over httpx; without this no traceparent header is sent and
-    # every service starts its own disconnected trace.
-    HTTPXClientInstrumentor().instrument()
+    _instrumentHttpx()
+
+
+def _instrumentHttpx():
+    """Outbound propagation over httpx.
+
+    SiteRM talks to agents, other frontends and the orchestrator over httpx;
+    without this no traceparent header is sent and every service starts its own
+    disconnected trace.
+
+    Guarded separately from the SDK import above on purpose. Grouping it there
+    made one optional instrumentation package able to set OTEL_SDK_AVAILABLE to
+    False, which disables tracing entirely even when the api, sdk and exporter
+    are all installed. Losing httpx propagation should cost the traceparent
+    header, not the traces.
+    """
+    try:
+        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+
+        HTTPXClientInstrumentor().instrument()
+    except Exception as ex:  # pragma: no cover
+        print(f"OpenTelemetry httpx instrumentation skipped. Error: {ex}")
