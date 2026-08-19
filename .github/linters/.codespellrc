@@ -1,0 +1,10 @@
+[codespell]
+# Domain vocabulary and existing identifiers that codespell reads as typos.
+#
+#   inport     - "input port" throughout PolicyService; a real SENSE/NML term,
+#                not a misspelling of "import"
+#   graphin    - the graphIn parameter name
+#   requestor  - spelling used by the delta request-tracking API and its callers
+#   standarts  - the repository's own top-level directory name, so any comment
+#                that points at standarts/pylintrc trips this
+ignore-words-list = inport,graphin,requestor,standarts

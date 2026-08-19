@@ -1,0 +1,9 @@
+---
+skip-check:
+  # "GitHub Actions workflow_dispatch inputs MUST be empty."
+  #
+  # The dev image workflows take a single `ref` input so a specific commit can
+  # be rebuilt by hand without pushing. It selects the source location, which is
+  # the case CKV_GHA_7 explicitly permits, and it is consumed through env rather
+  # than interpolated into a run: body, so it cannot inject shell.
+  - CKV_GHA_7

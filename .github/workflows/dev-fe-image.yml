@@ -33,6 +33,13 @@ env:
   # Branch of the sense-*-collection ansible repos.
   GITBRANS: master
 
+# Declared explicitly rather than left to the repository default, which grants
+# write-all. Job-level permissions can only narrow this, so it lists exactly what
+# the build needs and nothing more.
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
