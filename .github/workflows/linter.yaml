@@ -25,7 +25,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Full history so super-linter can diff against the default branch.
           fetch-depth: 0
+          # Do not leave the token in .git/config afterwards. Super-linter reads
+          # the working tree, so it never needs the credential.
+          persist-credentials: false
 
       - name: Super-linter
         uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
