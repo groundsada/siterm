@@ -12,6 +12,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from SiteRMLibs.DBModels import REGISTRY, Base
+from SiteRMLibs.OtelWrapper import otelEnabled
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -44,21 +45,6 @@ def loadEnvFile(filepath="/etc/environment"):
     except Exception as ex:
         exc = traceback.format_exc()
         print(f"Failed loading env file {filepath}. Error: {ex}. Trace: {exc}")
-
-
-def otelEnabled() -> bool:
-    """Whether tracing is enabled. Accepts either gate name, matching
-    SiteRMLibs.OpenTelemetry.otelEnabled and MainUtilities.envBool semantics.
-
-    Duplicated rather than imported: SiteRMLibs.OpenTelemetry imports
-    MainUtilities, and MainUtilities imports dbinterface from this module, so a
-    top-level import here would be circular.
-    """
-    for name in ("OPENTELEMETRY_ENABLED", "OTEL_ENABLED"):
-        val = os.getenv(name)
-        if val is not None and val.strip('"').strip("'").lower() in {"1", "true", "yes", "on"}:
-            return True
-    return False
 
 
 def buildDatabaseURL() -> str:
@@ -117,7 +103,8 @@ class DBBackend:
         if not otelEnabled():
             return
         try:
-            # Imported here, not at module scope: see otelEnabled() above.
+            # Imported here, not at module scope: the instrumentation package is
+            # optional, and OtelWrapper deliberately does not depend on it.
             from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 
             SQLAlchemyInstrumentor().instrument(engine=self.engine)

@@ -18,8 +18,6 @@ import tracemalloc
 
 import psutil
 from deepdiff import DeepDiff
-from opentelemetry import trace
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from SiteRMLibs import __version__ as runningVersion
 from SiteRMLibs.CustomExceptions import (
     HTTPServerNotReady,
@@ -46,13 +44,20 @@ from SiteRMLibs.MainUtilities import (
     timeout,
 )
 from SiteRMLibs.OpenTelemetry import init_otel
+from SiteRMLibs.OtelWrapper import (
+    getTracer,
+    instrumentLogging,
+    setSpanStatus,
+    statusError,
+    statusOk,
+)
 
 # The daemon-services root tracer. Each poll cycle of every SiteRM service
 # (DBWorker, PolicyService, SNMPMonitoring, ...) runs through Daemonizer.run(),
 # so a span here becomes the root that the LoggingInstrumentor's trace_id
 # attaches to -- turning the previously inert trace_id=0 log lines into
 # correlatable ones (#6 / #10).
-_daemon_tracer = trace.get_tracer("siterm.daemonizer")
+_daemon_tracer = getTracer("siterm.daemonizer")
 
 
 def getParser(description):
@@ -288,7 +293,7 @@ class Daemon(DBBackend):
         """Initialize the daemon."""
         loadEnvFile()
         init_otel(component)
-        LoggingInstrumentor().instrument(set_logging_format=True)
+        instrumentLogging()
         logType = "TimedRotatingFileHandler"
         if inargs.logtostdout:
             logType = "StreamLogger"
@@ -679,8 +684,11 @@ class Daemon(DBBackend):
                     with _daemon_tracer.start_as_current_span(
                         f"{self.component}.{sitename}.poll",
                         attributes={
+                            # No service.name here: init_otel() already sets it as
+                            # a Resource attribute, and repeating it at span level
+                            # overrides a resource-level semantic-convention key.
                             "sitename": sitename,
-                            "service.name": self.component,
+                            "siterm.component": self.component,
                             "run.count": self.runCount + 1,
                         },
                     ) as poll_span:
@@ -689,7 +697,7 @@ class Daemon(DBBackend):
                             with timeout(180):
                                 speedup = self.__run(rthread)
                             self.reporter("OK", sitename, stwork)
-                            poll_span.set_status(trace.Status(trace.StatusCode.OK))
+                            setSpanStatus(poll_span, statusOk())
                         except ServiceWarning as ex:
                             exc = traceback.format_exc()
                             self.reporter("WARNING", sitename, stwork, str(ex))
@@ -710,7 +718,7 @@ class Daemon(DBBackend):
                             self.reporter("FAILED", sitename, stwork, str(ex))
                             exc = traceback.format_exc()
                             self.logger.critical(f"Exception!!! Error details:  {ex}. Traceback details: {exc}")
-                            poll_span.set_status(trace.Status(trace.StatusCode.ERROR, str(ex)))
+                            setSpanStatus(poll_span, statusError(str(ex)))
                             poll_span.record_exception(ex)
                         finally:
                             self.postRunThread(sitename, rthread)

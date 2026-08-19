@@ -19,8 +19,6 @@ import time
 import traceback
 
 import dictdiffer
-from opentelemetry import trace
-from opentelemetry.trace import Link
 from dateutil import parser
 from rdflib import URIRef
 from rdflib.plugins.parsers.notation3 import BadSyntax
@@ -56,28 +54,15 @@ from SiteRMLibs.MainUtilities import (
     parseRDFFile,
     writeActiveDeltas,
 )
+from SiteRMLibs.OtelWrapper import (
+    getTracer,
+    linksFromTraceparent,
+    setSpanStatus,
+    statusError,
+)
 from SiteRMLibs.timing import Timing
 
-_delta_tracer = trace.get_tracer("siterm.policyservice")
-
-
-def _span_from_traceparent(tp):
-    """Build a remote parent SpanContext from a W3C traceparent string, or
-    None if invalid/absent. Used as a Link target so async-accepted deltas
-    hang off the trace of the request that submitted them (#4)."""
-    try:
-        version, trace_id, span_id, flags = tp.split("-", 3)
-        if len(version) != 2 or len(trace_id) != 32 or len(span_id) != 16:
-            return None
-        return trace.SpanContext(
-            trace_id=int(trace_id, 16),
-            span_id=int(span_id, 16),
-            is_remote=True,
-            trace_flags=trace.TraceFlags(int(flags, 16)),
-            trace_state=trace.TraceState(),
-        )
-    except (ValueError, AttributeError):
-        return None
+_delta_tracer = getTracer("siterm.policyservice")
 
 
 def getError(ex):
@@ -1064,7 +1049,10 @@ class PolicyService(RDFHelper, Timing, BWService):
         with _delta_tracer.start_as_current_span(
             "acceptDelta",
             attributes={"delta.path": deltapath, "delta.traceparent": _delta_traceparent},
-            links=[Link(_span_from_traceparent(_delta_traceparent))] if _delta_traceparent else None,
+            # Keyed on whether the traceparent PARSED, not merely on it being
+            # non-empty -- a truncated or corrupt value in the delta file
+            # previously produced Link(None).
+            links=linksFromTraceparent(_delta_traceparent),
         ) as _accept_span:
             try:
                 self._addDeltasToModel(currentGraph, toDict.get("content", {}))
@@ -1081,7 +1069,7 @@ class PolicyService(RDFHelper, Timing, BWService):
                     self.logger.error(f"Unexpected error during delta acceptance: {ex}")
                     self.logger.error(f"Full traceback: {traceback.format_exc()}")
                     _accept_span.record_exception(ex)
-                    _accept_span.set_status(trace.Status(trace.StatusCode.ERROR))
+                    setSpanStatus(_accept_span, statusError())
                     toDict["State"] = "failed"
                     toDict["Error"] = getError(ex)
                     self.stateMachine.failed(self.dbI, toDict)

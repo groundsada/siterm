@@ -19,25 +19,12 @@ import traceback
 
 import ansible_runner
 import yaml
-from opentelemetry import trace
-from opentelemetry.trace.propagation.tracecontext import (
-    TraceContextTextMapPropagator,
-)
 from SiteRMLibs.Backends import parsers
 from SiteRMLibs.CustomExceptions import ConfigException
 from SiteRMLibs.MainUtilities import getLoggingObject, withTimeout
+from SiteRMLibs.OtelWrapper import getTracer, traceparent
 
-_ansible_tracer = trace.get_tracer("siterm.ansible")
-_trace_propagator = TraceContextTextMapPropagator()
-
-
-def _traceparent():
-    """Current W3C traceparent (trace-id, span-id, flags) for the active span,
-    or empty when no span is active. Handed to ansible_runner's subprocess so a
-    child can correlate back into this daemon's trace."""
-    carrier = {}
-    _trace_propagator.inject(carrier)
-    return carrier.get("traceparent", "")
+_ansible_tracer = getTracer("siterm.ansible")
 
 
 class Switch:
@@ -166,7 +153,7 @@ class Switch:
                             "ANSIBLE_RUNNER_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_job_timeout")),
                             # Best-effort: let ansible's own processes see the
                             # parent trace so remote logs could correlate.
-                            "TRACEPARENT": _traceparent(),
+                            "TRACEPARENT": traceparent(),
                         },
                     )
                     self.__logAnsibleOutput(ansOut)

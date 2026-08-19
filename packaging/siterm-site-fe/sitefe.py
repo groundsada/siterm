@@ -9,9 +9,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from opentelemetry import trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.trace import Status, StatusCode
 from SiteFE.REST.Auth import router as auth_router
 from SiteFE.REST.Debug import router as debug_router
 from SiteFE.REST.Delta import router as delta_router
@@ -23,6 +20,12 @@ from SiteFE.REST.Service import router as service_router
 from SiteFE.REST.Topo import router as topo_router
 from SiteRMLibs.MainUtilities import envBool, loadEnvFile
 from SiteRMLibs.OpenTelemetry import init_otel, otelEnabled
+from SiteRMLibs.OtelWrapper import (
+    getCurrentSpan,
+    getTracer,
+    setSpanStatus,
+    statusError,
+)
 
 loadEnvFile()
 
@@ -39,11 +42,18 @@ OTEL_BODY_MAXLEN = int(os.getenv("OTEL_BODY_MAXLEN", "1024"))
 
 if OTEL_ENABLED:
     init_otel("siterm-site-fe")
-    FastAPIInstrumentor.instrument_app(
-        app,
-        http_capture_headers_server_request=["user-agent", "if-modified-since", "accept"],
-        http_capture_headers_server_response=["content-type", "content-length", "cache-control"],
-    )
+    try:
+        # Optional dependency: a frontend without the instrumentation package
+        # still serves requests, just without server spans.
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(
+            app,
+            http_capture_headers_server_request=["user-agent", "if-modified-since", "accept"],
+            http_capture_headers_server_response=["content-type", "content-length", "cache-control"],
+        )
+    except ImportError as ex:
+        print(f"OpenTelemetry FastAPI instrumentation skipped. Error: {ex}")
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -67,10 +77,10 @@ async def exception_capture(request: Request, call_next):
         return await call_next(request)
     except Exception as exc:
         if OTEL_ENABLED:
-            span = trace.get_current_span()
+            span = getCurrentSpan()
             if span:
                 span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR))
+                setSpanStatus(span, statusError())
         raise
 
 
@@ -80,7 +90,7 @@ async def observability_middleware(request: Request, call_next):
     if not OTEL_ENABLED:
         return await call_next(request)
 
-    tracer = trace.get_tracer("siterm.api")
+    tracer = getTracer("siterm.api")
 
     start_time = time.time()
 
@@ -111,7 +121,7 @@ async def observability_middleware(request: Request, call_next):
 
         except Exception as exc:
             span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR))
+            setSpanStatus(span, statusError())
             raise
 
 
