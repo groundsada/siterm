@@ -1,7 +1,8 @@
 """OpenTelemetry initialization and utilities.
 
 SDK wiring only. Span-creation helpers live in SiteRMLibs.OtelWrapper, which is
-dependency-free so DBBackend can use it too; see the note there.
+dependency-free so DBBackend can use it too; see the note there. Exporter
+construction lives in SiteRMLibs.OtelExporters.
 
 Everything here is optional. If the opentelemetry packages are not installed,
 init_otel() returns quietly and SiteRM runs untraced rather than failing to
@@ -12,11 +13,11 @@ import os
 
 from SiteRMLibs import __version__
 from SiteRMLibs.MainUtilities import loadEnvFile
+from SiteRMLibs.OtelExporters import buildExporter
 from SiteRMLibs.OtelWrapper import OTEL_AVAILABLE, envBool, otelEnabled
 
 try:  # pragma: no cover - import guard, see module docstring
     from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
     from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import (
@@ -32,35 +33,34 @@ except ImportError:  # pragma: no cover
 
 loadEnvFile()
 
-__all__ = ["init_otel", "otelEnabled", "OTEL_AVAILABLE"]
+__all__ = ["init_otel", "otelEnabled", "OTEL_AVAILABLE", "buildResource"]
 
 
-def _buildExporter(endpoint):
-    """OTLP span exporter for `endpoint`.
+def buildResource(service_name):
+    """Resource for this process.
 
-    TLS is the default. The previous revision hardcoded `insecure=True`, which is
-    fine for an in-cluster collector but not for the deployed topology, where the
-    frontend is the site's egress point and pushes spans across the internet to a
-    central gateway. Spans carry delta ids, topology and the authenticated user
-    subject; that is not plaintext material.
-
-    `insecure` is passed only when OTLP_INSECURE is explicitly set, so when it is
-    unset the SDK's own OTEL_EXPORTER_OTLP_* environment handling applies and the
-    channel defaults to secure.
+    `sitename` is deliberately absent. The gateway stamps it from the verified
+    credential and overwrites anything sent, so setting it here would be a value
+    that is always discarded -- and one that reads, to anyone looking at this
+    file, as though the site were the authority on its own identity.
     """
-    kwargs = {"endpoint": endpoint}
+    return Resource.create({"service.name": service_name, "service.version": __version__})
 
-    if os.getenv("OTLP_INSECURE") is not None:
-        kwargs["insecure"] = envBool("OTLP_INSECURE", False)
 
-    # Tempo/Loki/Mimir are multi-tenant and keyed on X-Scope-OrgID. Carry the
-    # tenant as an OTLP header so spans land in the right tenant instead of being
-    # rejected as "no tenant ID".
-    tenant = os.getenv("OTLP_TENANT")
-    if tenant:
-        kwargs["headers"] = {"x-scope-orgid": tenant}
+def _sampler():
+    """Head sampler.
 
-    return OTLPSpanExporter(**kwargs)
+    Defaults to 1.0 -- sample everything and let the gateway decide. Tail
+    sampling there keeps or drops a trace as a unit after all its spans have
+    arrived, and keeps errors and slow traces unconditionally. Dropping 90% here
+    first would just multiply: the gateway can only choose among traces it was
+    given, and it would never see the error traces discarded at the site.
+
+    OTEL_SAMPLE_RATE remains for local development against a collector that does
+    no tail sampling.
+    """
+    rate = float(os.getenv("OTEL_SAMPLE_RATE", "1.0"))
+    return ParentBased(TraceIdRatioBased(rate))
 
 
 def init_otel(service_name):
@@ -75,18 +75,15 @@ def init_otel(service_name):
     if isinstance(trace.get_tracer_provider(), TracerProvider):
         return
 
-    resource = Resource.create({"service.name": service_name, "service.version": __version__})
-
-    samplerate = 1.0 if envBool("OPENTELEMETRY_DEBUG", False) else float(os.getenv("OTEL_SAMPLE_RATE", "0.1"))
-    provider = TracerProvider(resource=resource, sampler=ParentBased(TraceIdRatioBased(samplerate)))
+    provider = TracerProvider(resource=buildResource(service_name), sampler=_sampler())
     trace.set_tracer_provider(provider)
 
     endpoint = os.getenv("OTLP_ENDPOINT")
-    if endpoint:
-        span_processor = BatchSpanProcessor(_buildExporter(endpoint))
+    exporter = buildExporter("traces", endpoint) if endpoint else None
+    if exporter is not None:
+        provider.add_span_processor(BatchSpanProcessor(exporter))
     else:
-        span_processor = SimpleSpanProcessor(ConsoleSpanExporter())
-    provider.add_span_processor(span_processor)
+        provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
 
     _instrumentHttpx()
 
