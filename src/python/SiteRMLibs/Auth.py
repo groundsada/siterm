@@ -221,6 +221,8 @@ class AuthHandler:
         self.oidc_app_name = os.environ.get("OIDC_APP_NAME", "SITERM Token Issuer.")
         self.oidc_issuer = os.environ.get("OIDC_ISSUER", self.gitConf.get("general", "webdomain"))
         self.oidc_audience = os.environ.get("OIDC_AUDIENCE", self.gitConf.get("general", "webdomain"))
+        self.oidc_extra_audience = os.environ.get("OIDC_EXTRA_AUDIENCE", "")
+        self.oidc_sitename = os.environ.get("OIDC_SITENAME", self.gitConf.get("general", "sitename", ""))
         self.oidc_algorithm = os.environ.get("OIDC_ALGORITHM", "RS256")
         self.oidc_token_lifetime_minutes = int(os.environ.get("OIDC_TOKEN_LIFETIME_MINUTES", "60"))
         self.refresh_token_ttl = timedelta(hours=int(os.environ.get("REFRESH_TOKEN_TTL_HOURS", "12"))).total_seconds()
@@ -481,7 +483,7 @@ class AuthHandler:
 
         payload = {
             "iss": self.oidc_issuer,
-            "aud": self.oidc_audience,
+            "aud": [self.oidc_audience, self.oidc_extra_audience] if self.oidc_extra_audience else self.oidc_audience,
             "sub": usersub,
             "iat": int(now),
             "exp": int(exp),
@@ -489,6 +491,10 @@ class AuthHandler:
 
         if "extra_claims" in kwargs:
             payload.update(kwargs["extra_claims"])
+
+        # Set after extra_claims so a caller cannot override it.
+        if self.oidc_sitename:
+            payload["sitename"] = self.oidc_sitename
 
         headers = {"kid": self.oidc_kid, "typ": "JWT"}
 
