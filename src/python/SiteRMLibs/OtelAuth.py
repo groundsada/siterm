@@ -1,133 +1,76 @@
 #!/usr/bin/env python3
-"""OAuth2 client credentials for the OTLP exporters.
+"""Bearer tokens for the OTLP exporters, from the SiteRM frontend.
 
-The central gateway authenticates every push and derives the site's identity
-from the token, so a site never declares who it is. That means SiteRM has to
-present a credential on every export, and has to keep presenting a valid one for
-the life of the process.
+The gateway derives site identity from the token issuer, so every export carries
+one. Acquiring it is SiteRM's existing X509 challenge-response: the host cert is
+presented, a server challenge is signed with the host key, and a short-lived JWT
+comes back. HTTPLibrary.Requests already implements that, including refresh and
+rate-limit backoff, so this only adds caching and a never-raise contract.
 
-Configuration, from /etc/environment like the rest:
+    OTLP_AUTH_URL     frontend that issues the token, e.g. https://fe.example
+    OTLP_AUTH_ENABLED optional, "false" to export unauthenticated
 
-    OTLP_AUTH_ISSUER          e.g. https://<keycloak>/realms/sense-telemetry
-    OTLP_AUTH_CLIENT_ID       e.g. siterm-T2_US_SDSC
-    OTLP_AUTH_CLIENT_SECRET
-    OTLP_AUTH_TOKEN_URL       optional, overrides the derived token endpoint
-    OTLP_AUTH_VERIFY          optional, "false" to skip TLS verification
-
-When OTLP_AUTH_ISSUER is unset this module is inert and the exporters get no
-auth header, so local development against a plaintext collector is unchanged.
-
-Dependency-free apart from `requests`, for the same reason OtelWrapper is: it
-must be importable from anywhere without dragging SiteRMLibs.MainUtilities and
-the DBBackend cycle along with it.
+Cert and key come from getKeyCertFromEnv(), the same search order every other
+SiteRM component uses. When neither is configured this module is inert.
 """
 
 import os
 import threading
 import time
 
-try:  # pragma: no cover - requests is a hard dependency, guard is belt and braces
-    import requests
-except ImportError:  # pragma: no cover
-    requests = None
+from SiteRMLibs.HTTPLibrary import Requests, getKeyCertFromEnv
+from SiteRMLibs.OtelWrapper import envBool
 
-# Refresh this long before the token actually expires. A token that expires
-# mid-batch produces a 401 the exporter reports as a generic export failure,
-# which is the hardest possible way to discover a clock or config problem.
-REFRESH_MARGIN = 300
-
-# Never hammer the IdP. If it is down we retry on this floor rather than on
-# every single export call.
+# Retry floor, so a frontend that is down is not hammered on every export.
 MIN_RETRY_INTERVAL = 30
 
 
 class OtelTokenSource:
-    """Caches a bearer token and refreshes it before expiry.
+    """Caches a bearer token for the exporters and renews it on demand."""
 
-    Thread-safe: BatchSpanProcessor, the metric reader and the log processor all
-    export from their own threads, and all three ask for the same token.
-    """
-
-    def __init__(self, issuer=None, clientId=None, clientSecret=None, tokenUrl=None, verify=None):
-        self.issuer = issuer if issuer is not None else os.getenv("OTLP_AUTH_ISSUER", "")
-        self.clientId = clientId if clientId is not None else os.getenv("OTLP_AUTH_CLIENT_ID", "")
-        self.clientSecret = clientSecret if clientSecret is not None else os.getenv("OTLP_AUTH_CLIENT_SECRET", "")
-        self.tokenUrl = tokenUrl or os.getenv("OTLP_AUTH_TOKEN_URL", "")
-        if verify is None:
-            verify = os.getenv("OTLP_AUTH_VERIFY", "true").strip('"').strip("'").lower() not in {"0", "false", "no", "off"}
-        self.verify = verify
-        if not self.tokenUrl and self.issuer:
-            self.tokenUrl = f"{self.issuer.rstrip('/')}/protocol/openid-connect/token"
+    def __init__(self):
         self._lock = threading.Lock()
-        self._token = ""
-        self._expiresAt = 0.0
-        self._nextAttempt = 0.0
-        self.lastError = ""
+        self._requests = None
+        self._nextRetry = 0
+        self._url = (os.getenv("OTLP_AUTH_URL") or "").strip()
 
     def configured(self):
-        """Whether enough is set to attempt a token fetch."""
-        return bool(self.tokenUrl and self.clientId and self.clientSecret and requests is not None)
-
-    def _fetch(self):
-        """One token request. Returns True on success."""
-        try:
-            resp = requests.post(
-                self.tokenUrl,
-                data={
-                    "grant_type": "client_credentials",
-                    "client_id": self.clientId,
-                    "client_secret": self.clientSecret,
-                },
-                timeout=10,
-                verify=self.verify,
-            )
-            if resp.status_code != 200:
-                self.lastError = f"token endpoint returned {resp.status_code}"
-                return False
-            payload = resp.json()
-            token = payload.get("access_token", "")
-            if not token:
-                self.lastError = "token endpoint returned no access_token"
-                return False
-            # Trust expires_in, but floor it so a bogus or tiny value cannot turn
-            # this into a request-per-export loop against the IdP.
-            lifetime = float(payload.get("expires_in", 3600) or 3600)
-            self._token = token
-            self._expiresAt = time.time() + max(lifetime, 60.0)
-            self.lastError = ""
-            return True
-        except Exception as ex:  # pragma: no cover - network paths
-            self.lastError = str(ex)
+        """Whether a token can be obtained at all."""
+        if not self._url or not envBool("OTLP_AUTH_ENABLED", True):
             return False
+        cert, key = getKeyCertFromEnv()
+        return bool(cert and key)
+
+    def _client(self):
+        """Lazily built Requests, which owns the token and its refresh."""
+        if self._requests is None:
+            self._requests = Requests(url=self._url)
+        return self._requests
 
     def token(self):
-        """Current token, fetching or refreshing as needed. "" when unavailable.
+        """Current bearer token, or "" if one cannot be obtained.
 
-        Returning "" rather than raising is deliberate. Telemetry is not a hard
-        dependency: if the IdP is unreachable at startup SiteRM must still boot
-        and serve. The export then fails and is counted, which is #17's job.
+        Never raises: a failure here must degrade to an unauthenticated export
+        the gateway rejects and OtelHealth counts, not take down the caller.
         """
         if not self.configured():
             return ""
         with self._lock:
             now = time.time()
-            if self._token and now < self._expiresAt - REFRESH_MARGIN:
-                return self._token
-            if now < self._nextAttempt:
-                # Still inside the backoff window; hand back whatever we have,
-                # which may be a token that is valid but inside the margin.
-                return self._token if now < self._expiresAt else ""
-            self._nextAttempt = now + MIN_RETRY_INTERVAL
-            if self._fetch():
-                return self._token
-            return self._token if now < self._expiresAt else ""
+            if now < self._nextRetry:
+                return ""
+            try:
+                # Cheap when the cached token is still valid; renews when not.
+                return self._client().ensureBearerToken() or ""
+            except Exception as ex:
+                self._nextRetry = now + MIN_RETRY_INTERVAL
+                print(f"OpenTelemetry: could not obtain a token from {self._url}. Error: {ex}")
+                return ""
 
     def headers(self):
-        """Auth headers for an OTLP exporter, or {} when unconfigured."""
-        tok = self.token()
-        if not tok:
-            return {}
-        return {"authorization": f"Bearer {tok}"}
+        """Authorization header dict, empty when unauthenticated."""
+        token = self.token()
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 _SOURCE = None
@@ -135,7 +78,7 @@ _SOURCE_LOCK = threading.Lock()
 
 
 def getTokenSource():
-    """Process-wide token source, so all three signals share one token."""
+    """Process-wide token source."""
     global _SOURCE  # pylint: disable=global-statement
     with _SOURCE_LOCK:
         if _SOURCE is None:
