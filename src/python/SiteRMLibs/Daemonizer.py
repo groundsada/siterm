@@ -702,7 +702,6 @@ class Daemon(DBBackend):
                     # Root span for this site's poll cycle. This is the span the
                     # LoggingInstrumentor records trace_id from, so each poll is
                     # one trace with the worker's spans nested under it.
-                    cycleDuration, lastSuccess, cycleErrors = _cycleMetrics()
                     cycleStart = time.time()
                     outcome = "ok"
                     with _daemon_tracer.start_as_current_span(
@@ -749,12 +748,7 @@ class Daemon(DBBackend):
                             outcome = "failed"
                         finally:
                             self.postRunThread(sitename, rthread)
-                            attrs = {"component": self.component, "sitename": sitename}
-                            cycleDuration.record(time.time() - cycleStart, attrs)
-                            if outcome == "ok":
-                                lastSuccess.set(getUTCnow(), attrs)
-                            else:
-                                cycleErrors.add(1, dict(attrs, outcome=outcome))
+                            self._recordCycle(sitename, cycleStart, outcome)
                             self.logger.debug("Finished worker for %s site", sitename)
                 if self.runLoop():
                     time.sleep(self.sleepTimers["ok"] // 2 if speedup else self.sleepTimers["ok"])
@@ -776,6 +770,16 @@ class Daemon(DBBackend):
                 self._refreshConfig()
                 self.refreshThreads()
             self.logger.debug("Daemonizer main loop end. Run count: %s", self.runCount)
+
+    def _recordCycle(self, sitename, started, outcome):
+        """Record one poll cycle on the fleet-health instruments."""
+        duration, lastSuccess, errors = _cycleMetrics()
+        attrs = {"component": self.component, "sitename": sitename}
+        duration.record(time.time() - started, attrs)
+        if outcome == "ok":
+            lastSuccess.set(getUTCnow(), attrs)
+        else:
+            errors.add(1, dict(attrs, outcome=outcome))
 
     @staticmethod
     def getThreads():
