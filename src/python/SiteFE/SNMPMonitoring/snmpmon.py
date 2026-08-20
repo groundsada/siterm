@@ -29,7 +29,7 @@ from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDErr
 from prometheus_client import CollectorRegistry, generate_latest
 from SiteRMLibs.MetricsBridge import DualEnum, DualGauge, DualInfo
 from SiteRMLibs.OtelHealth import renderInto as renderOtelHealth
-from SiteRMLibs.OtelMetrics import initMetrics
+from SiteRMLibs.OtelMetrics import getHistogram, initMetrics
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
 from SiteRMLibs.GitConfig import getGitConfig
@@ -801,7 +801,9 @@ class SNMPMonitoring(Warnings):
         """Scan all switches and get snmp data"""
         self._start()
         macs = {}
+        pollDuration = getHistogram("siterm_snmp_poll_duration_seconds", "Wall time of one switch SNMP poll")
         for host in self.switches:
+            pollStart = time.time()
             self._getSNMPSession(host)
             if not self.session:
                 continue
@@ -819,6 +821,7 @@ class SNMPMonitoring(Warnings):
                     out[indx][key] = item.value.replace("\x00", "")
             out["macs"] = macs[host]
             self._writeToDB(host, out)
+            pollDuration.record(time.time() - pollStart, {"hostname": host})
         self.logger.info(f"[{self.sitename}]: SNMP Monitoring finished for {len(self.switches)} switches")
         # Get Memory and Disk Statistics
         self.getMemStats()

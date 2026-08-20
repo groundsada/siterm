@@ -22,6 +22,7 @@ import yaml
 from SiteRMLibs.Backends import parsers
 from SiteRMLibs.CustomExceptions import ConfigException
 from SiteRMLibs.MainUtilities import getLoggingObject, withTimeout
+from SiteRMLibs.OtelMetrics import getCounter, getHistogram
 from SiteRMLibs.OtelWrapper import getTracer, traceparent
 
 _ansible_tracer = getTracer("siterm.ansible")
@@ -125,6 +126,9 @@ class Switch:
         # As we might be running multiple workers, we need to make sure
         # cleanup process is done correctly.
         retryCount = self.config.getint("ansible", "ansible_runtime_retry")
+        ansDuration = getHistogram("siterm_ansible_duration_seconds", "Wall time of one ansible playbook run")
+        ansRetries = getCounter("siterm_ansible_retries_total", "Ansible playbook attempts that had to be retried")
+        started = time.time()
         # ansible_runner runs a subprocess, which severs the OTel context chain
         # (this is the "ansible boundary" of #6). Wrap the run in a child span
         # so each ansible invocation still nests under the daemon poll span, and
@@ -158,11 +162,13 @@ class Switch:
                     )
                     self.__logAnsibleOutput(ansOut)
                     ans_span.set_attribute("ansible.rc", getattr(ansOut, "rc", -1))
+                    ansDuration.record(time.time() - started, {"playbook": playbook, "outcome": "ok"})
                     return ansOut
                 except FileNotFoundError as ex:
                     self.logger.error(f"Ansible playbook got FileNotFound (usually cleanup. Will retry in 5sec): {ex}")
                     self.logger.debug(f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}")
                     retryCount -= 1
+                    ansRetries.add(1, {"playbook": playbook})
                     time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
                 except Exception as ex:
                     self.logger.error(f"Ansible playbook got unexpected Exception: {ex}")
@@ -173,7 +179,10 @@ class Switch:
                     self.logger.debug(f"Full traceback: {traceback.format_exc()}")
                     ans_span.record_exception(ex)
                     retryCount -= 1
+                    ansRetries.add(1, {"playbook": playbook})
                     time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+        # The retry loop is exhausted, which until now left no trace at all.
+        ansDuration.record(time.time() - started, {"playbook": playbook, "outcome": "failed"})
         raise Exception("Ansible playbook execution failed after 3 retries. Check logs for more details.")
 
     def getAnsNetworkOS(self, host, subitem=""):
