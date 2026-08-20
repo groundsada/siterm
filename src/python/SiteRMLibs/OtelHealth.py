@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Makes OTLP export failure visible.
+"""Counters for OTLP export outcomes, so a broken telemetry path is visible.
 
-When export fails, nothing in SiteRM says so today. `BatchSpanProcessor` logs
-through the SDK's own logger and drops spans on a full queue; SiteRM neither
-surfaces that nor exposes it. A telemetry system whose own failure is invisible
-is worse than no telemetry, because the dashboards keep rendering and simply
-stop being true.
-
-These counters go out over the PROMETHEUS PULL PATH, deliberately. A metric that
-reports "telemetry is not reaching the gateway" must not itself travel over the
-path that is broken. They are accumulated here and rendered into the per-cycle
-registry that becomes snmpinfo.txt, so they ride the 29 existing scrape jobs.
-
-That also avoids a recursion: recording export failures into the meter provider
-would mean the metrics exporter's own failures mutate an instrument that the
-metrics exporter is in the middle of collecting.
+Rendered onto the prometheus pull path rather than pushed: a metric reporting
+"telemetry is not reaching the gateway" must not travel over the broken path,
+and recording into the meter provider would mutate an instrument the metrics
+exporter is mid-collection on.
 """
 
 import threading
@@ -22,11 +12,8 @@ import time
 
 from prometheus_client import Counter, Gauge, disable_created_metrics
 
-# Counters otherwise emit a companion `<name>_created` series. Nothing queries
-# them, and snmpinfo.txt is scraped by 29 production jobs -- doubling the series
-# count of every counter added here is not worth a timestamp nobody reads. Safe
-# to do globally: every pre-existing SiteRM metric is a Gauge, Info or Enum,
-# none of which emit `_created`.
+# Suppresses the `<name>_created` companion series. Safe globally: every
+# pre-existing SiteRM metric is a Gauge, Info or Enum, none of which emit it.
 disable_created_metrics()
 
 _LOCK = threading.Lock()
@@ -54,11 +41,9 @@ def recordFailure(signal, reason, count=0):
 def noteHttpStatus(signal, status):
     """Remember the last HTTP status seen for `signal`.
 
-    The OTLP/HTTP exporters return SpanExportResult.FAILURE rather than raising,
-    so the status code never reaches the wrapper and every failure would be
-    labelled "rejected" -- including the one that matters most, an expired or
-    wrong credential. The session hook sees the response, so it records the code
-    here and the wrapper uses it to pick an honest reason.
+    The OTLP/HTTP exporters return FAILURE rather than raising, so the status
+    never reaches the wrapper and every failure would be labelled "rejected".
+    The session hook sees the response and records the code here instead.
     """
     with _LOCK:
         _LAST_STATUS[signal] = status
@@ -101,11 +86,8 @@ def reset():
 def renderInto(registry):
     """Emit the health counters into a per-cycle prometheus registry.
 
-    The registry is rebuilt each cycle, so these are declared fresh each time and
-    incremented by the cumulative total. The rendered value is therefore the real
-    cumulative count and the series is a genuine counter, despite the registry
-    being thrown away -- which is the same trick that makes the accumulators here
-    necessary in the first place.
+    Declared fresh each cycle and incremented by the cumulative total, so the
+    rendered series is a genuine counter despite the registry being discarded.
     """
     data = snapshot()
 
@@ -139,8 +121,7 @@ def renderInto(registry):
         if value:
             failures.labels(signal=signal, reason=reason).inc(value)
 
-    # Absolute timestamp rather than an age, so `time() - metric` is computed at
-    # query time against the scraping clock rather than baked in at write time.
+    # Absolute timestamp, not an age, so staleness is computed at query time.
     lastok = Gauge(
         "siterm_otel_last_export_success_timestamp_seconds",
         "When an OTLP export last succeeded",
@@ -152,11 +133,7 @@ def renderInto(registry):
 
 
 def _classify(exc):
-    """Coarse reason label for an exception or a failed result.
-
-    Deliberately low cardinality: this is a label, and the useful question is
-    "auth, network, or the backend refused it", not the exact message.
-    """
+    """Coarse reason label for an exception. Low cardinality: it becomes a label."""
     text = str(exc).lower()
     if "401" in text or "unauthenticated" in text or "authentication" in text or "403" in text:
         return "auth"
@@ -172,10 +149,8 @@ def _classify(exc):
 class CountingExporter:
     """Delegating exporter that records the outcome of every export.
 
-    Wraps rather than subclasses so one class covers spans, metrics and logs.
-    `__getattr__` forwards everything else, which matters for metrics:
-    PeriodicExportingMetricReader reads `_preferred_temporality` and
-    `_preferred_aggregation` off the exporter it is given.
+    Wraps rather than subclasses so one class covers all three signals.
+    `__getattr__` forwards the temporality attributes the metric reader needs.
     """
 
     def __init__(self, inner, signal):

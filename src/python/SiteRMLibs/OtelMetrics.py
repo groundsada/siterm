@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """The meter provider, and the instrument cache that makes counters possible.
 
-SiteRM's existing metrics are `prometheus_client` gauges declared against a
-fresh `CollectorRegistry` built once per collection cycle and thrown away. That
-has one consequence that shapes everything: a counter cannot exist. Anything
-declared against a registry that is discarded each cycle restarts at zero each
-cycle, so rate() and increase() over it are meaningless.
+SiteRM's metrics are declared against a CollectorRegistry rebuilt every cycle,
+so a counter cannot exist there. Instruments here live for the process instead,
+and both readers observe the same ones:
 
-One meter provider, two readers:
-
-    MeterProvider ──┬── PrometheusReader ────────► /metrics   (the 29 scrape jobs)
+    MeterProvider ──┬── PrometheusReader ────────► /metrics   (29 scrape jobs)
                     └── PeriodicExportingReader ─► OTLP ──► gateway ──► Mimir
 
-Instruments are created once and live for the process, so counters accumulate.
-Both readers observe the same instruments, so the scraped series and the pushed
-series are the same numbers by construction rather than by careful duplication.
-
-NAMING RULES, and they are not stylistic. The two readers do not agree about
-suffixes, so an instrument declared carelessly arrives under two different names
-and the parity check the dual path exists for becomes impossible:
+The readers disagree about suffixes, so a careless declaration arrives under two
+different names and parity cannot be checked:
 
   declared                        /metrics (pull)            Mimir (push)
   Counter, unit="s"               name_seconds_total         name
@@ -27,19 +18,10 @@ and the parity check the dual path exists for becomes impossible:
   Gauge, unit="s"                 name_seconds               name
   Gauge, unit=""                  name                       name          OK
 
-The pull reader appends `_total` to every counter and a suffix for every unit
-other than "1"/""; the gateway is set to `UnderscoreEscapingWithoutSuffixes` and
-appends nothing. So:
+Hence: units stay "" and go in the name, counters carry `_total` explicitly
+(getCounter enforces it), gauges use the exact final name.
 
-  * units stay "" -- put the unit in the NAME (`..._seconds`) if it matters
-  * counters carry `_total` in the name explicitly; getCounter enforces it
-  * gauges and up-down counters use the exact final name
-
-The eleven existing SiteRM series are all gauges, so migrating them under these
-rules produces byte-identical output on both paths. 67 alert rules and every
-existing panel bind to those names.
-
-Like the rest of the otel path this degrades to no-ops when the SDK is absent.
+Degrades to no-ops when the SDK is absent.
 """
 
 import os
@@ -98,9 +80,8 @@ _NOOP = _NoOpInstrument()
 def metricsEnabled():
     """Whether the OTel metrics path is on.
 
-    Separate from otelEnabled() so metrics can be turned on without traces and
-    the reverse. During the dual-path period a site may well want to push
-    metrics for parity checking before it is ready to push traces.
+    Separate from otelEnabled() so a site can push metrics for parity checking
+    before it is ready to push traces.
     """
     if not OTEL_METRICS_AVAILABLE:
         return False
@@ -121,9 +102,8 @@ def initMetrics(service_name, resource=None):
         if _PROVIDER is not None:
             return _PROVIDER
 
-        # Imported here rather than at module scope: buildResource pulls in
-        # SiteRMLibs.__version__ and MainUtilities, and this module is imported
-        # from places that must stay cycle-free.
+        # Local import: buildResource pulls in MainUtilities, and this module is
+        # imported from places that must stay cycle-free.
         if resource is None:
             from SiteRMLibs.OpenTelemetry import buildResource
 
@@ -166,10 +146,8 @@ def getMeter(name="siterm"):
 def _instrument(kind, name, description, unit, meterName):
     """Get-or-create an instrument, cached for the life of the process.
 
-    The cache is the whole point. Creating a counter per collection cycle is
-    what makes a counter useless, so every call site must get the same object
-    back. Keyed on kind and name because the SDK will happily hand out two
-    different instruments with the same name and different types.
+    Keyed on kind and name: the SDK will hand out two different instruments with
+    the same name and different types.
     """
     if not metricsEnabled():
         return _NOOP
@@ -195,12 +173,10 @@ def _instrument(kind, name, description, unit, meterName):
 
 
 def getCounter(name, description="", meterName="siterm"):
-    """Monotonic counter. Survives across cycles, which is the point.
+    """Monotonic counter, surviving across cycles.
 
-    `_total` is appended when absent rather than left to the caller: the pull
-    reader adds it and the push path does not, so a name without it silently
-    diverges between the two. Appending here makes both agree, and the reader
-    does not double-suffix a name that already ends in `_total`.
+    `_total` is appended when absent: the pull reader adds it and the push path
+    does not, so a name without it diverges between the two.
     """
     if not name.endswith("_total"):
         name = f"{name}_total"

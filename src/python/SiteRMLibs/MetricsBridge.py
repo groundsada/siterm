@@ -1,23 +1,13 @@
 #!/usr/bin/env python3
 """Writes one value to both metric paths at once.
 
-The migration constraint: 29 production scrape jobs, 67 alert rules and every
-existing dashboard panel read `snmpinfo.txt`, which is rendered by
-`prometheus_client` from a registry built fresh each cycle. That output must not
-change while the push path is being proven.
+29 scrape jobs, 67 alert rules and every existing panel read `snmpinfo.txt`, so
+its output must not change while the push path is being proven. Each class here
+keeps the `prometheus_client` object byte-identical and additionally records the
+same value into an OTel instrument, set from the same variable on the same line.
 
-So each of these keeps the existing `prometheus_client` object exactly as it was
--- same name, same labels, same rendered bytes -- and additionally records the
-same value into an OTel instrument that the OTLP reader pushes to Mimir. The two
-paths cannot disagree, because they are set from the same variable on the same
-line.
-
-This is a migration scaffold, not the end state. Once parity is confirmed in
-Grafana by graphing both datasources in one panel, the prometheus_client half
-comes out and `snmpinfo.txt` is rendered from the meter provider instead. Until
-then, dual-emit is the only version that is provably non-regressive.
-
-Call sites keep the shape they already have:
+A migration scaffold: once parity is confirmed the prometheus_client half comes
+out. Call sites keep the shape they already have:
 
     memInfo = DualGauge("memory_usage", "Memory Usage for Service",
                         ["servicename", "key", "hostname"], registry)
@@ -72,11 +62,8 @@ class _BoundInfo:
     def info(self, payload):
         """Set both paths.
 
-        prometheus_client renders an Info as `<name>_info` with the payload
-        merged into the labels and a constant value of 1. OTel has no Info type,
-        so the same shape is built by hand: a gauge fixed at 1 carrying the same
-        labels. The `_info` suffix is written into the instrument name because
-        the gateway appends nothing.
+        OTel has no Info type, so the prometheus shape is rebuilt by hand: a
+        gauge fixed at 1 with the payload merged into the labels.
         """
         self._prom.info(payload)
         attrs = dict(self._labels)
@@ -113,11 +100,8 @@ class _BoundEnum:
     def state(self, value):
         """Set both paths.
 
-        prometheus_client renders an Enum as one series per state, carrying an
-        extra label named after the metric, with 1.0 on the active state and 0.0
-        on the rest. Reproduced exactly rather than emitted as a single series,
-        because panels select on that label -- `service_state{service_state="OK"}`
-        is a real query in the existing dashboards.
+        One series per state with a label named after the metric, 1.0 on the
+        active one. Panels select on that label, e.g. service_state{service_state="OK"}.
         """
         self._prom.state(value)
         for state in self._states:

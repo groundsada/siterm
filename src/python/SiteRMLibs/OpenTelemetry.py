@@ -39,25 +39,17 @@ __all__ = ["init_otel", "otelEnabled", "OTEL_AVAILABLE", "buildResource"]
 def buildResource(service_name):
     """Resource for this process.
 
-    `sitename` is deliberately absent. The gateway stamps it from the verified
-    credential and overwrites anything sent, so setting it here would be a value
-    that is always discarded -- and one that reads, to anyone looking at this
-    file, as though the site were the authority on its own identity.
+    `sitename` is deliberately absent: the gateway stamps it from the verified
+    credential and overwrites anything sent.
     """
     return Resource.create({"service.name": service_name, "service.version": __version__})
 
 
 def _sampler():
-    """Head sampler.
+    """Head sampler, defaulting to 1.0 so the gateway's tail sampler decides.
 
-    Defaults to 1.0 -- sample everything and let the gateway decide. Tail
-    sampling there keeps or drops a trace as a unit after all its spans have
-    arrived, and keeps errors and slow traces unconditionally. Dropping 90% here
-    first would just multiply: the gateway can only choose among traces it was
-    given, and it would never see the error traces discarded at the site.
-
-    OTEL_SAMPLE_RATE remains for local development against a collector that does
-    no tail sampling.
+    Dropping here first would multiply: the gateway can only choose among traces
+    it was given, and would never see the error traces discarded at the site.
     """
     rate = float(os.getenv("OTEL_SAMPLE_RATE", "1.0"))
     return ParentBased(TraceIdRatioBased(rate))
@@ -89,17 +81,11 @@ def init_otel(service_name):
 
 
 def _instrumentHttpx():
-    """Outbound propagation over httpx.
+    """Outbound traceparent propagation over httpx.
 
-    SiteRM talks to agents, other frontends and the orchestrator over httpx;
-    without this no traceparent header is sent and every service starts its own
-    disconnected trace.
-
-    Guarded separately from the SDK import above on purpose. Grouping it there
-    made one optional instrumentation package able to set OTEL_SDK_AVAILABLE to
-    False, which disables tracing entirely even when the api, sdk and exporter
-    are all installed. Losing httpx propagation should cost the traceparent
-    header, not the traces.
+    Guarded separately from the SDK import: grouping them let one optional
+    package disable tracing entirely. Losing this should cost the header, not
+    the traces.
     """
     try:
         from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
