@@ -21,6 +21,7 @@ exporter: gRPC through call credentials, HTTP through a session hook.
 import os
 
 from SiteRMLibs.OtelAuth import getTokenSource
+from SiteRMLibs.OtelHealth import CountingExporter, noteHttpStatus
 
 _SIGNAL_PATHS = {"traces": "v1/traces", "metrics": "v1/metrics", "logs": "v1/logs"}
 
@@ -89,19 +90,21 @@ class _AuthSession:
     startup and start failing an hour later, once, silently.
     """
 
-    def __new__(cls, tokenSource):
+    def __new__(cls, tokenSource, signal):
         import requests  # local: keep module import cheap when otel is absent
 
         session = requests.Session()
         original = session.request
 
         def request(method, url, **kwargs):
-            """Inject the current token, then delegate."""
+            """Inject the current token, delegate, and note the status."""
             headers = kwargs.pop("headers", None) or {}
             token = tokenSource.token()
             if token:
                 headers["Authorization"] = f"Bearer {token}"
-            return original(method, url, headers=headers, **kwargs)
+            response = original(method, url, headers=headers, **kwargs)
+            noteHttpStatus(signal, getattr(response, "status_code", None))
+            return response
 
         session.request = request
         return session
@@ -159,8 +162,8 @@ def buildExporter(signal, endpoint, tokenSource=None):
             return None
         kwargs = {"endpoint": signalEndpoint(endpoint, signal)}
         if tokenSource.configured():
-            kwargs["session"] = _AuthSession(tokenSource)
-        return Exporter(**kwargs)
+            kwargs["session"] = _AuthSession(tokenSource, signal)
+        return CountingExporter(Exporter(**kwargs), signal)
 
     try:
         if signal == "traces":
@@ -193,4 +196,4 @@ def buildExporter(signal, endpoint, tokenSource=None):
                 "gRPC cannot carry a bearer token without TLS. Use the OTLP/HTTP endpoint "
                 "(port 4318) or a TLS gRPC endpoint. Exporting unauthenticated."
             )
-    return Exporter(**kwargs)
+    return CountingExporter(Exporter(**kwargs), signal)

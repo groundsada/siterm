@@ -27,6 +27,7 @@ from easysnmp import Session
 from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDError
 from prometheus_client import CollectorRegistry, generate_latest
 from SiteRMLibs.MetricsBridge import DualEnum, DualGauge, DualInfo
+from SiteRMLibs.OtelHealth import renderInto as renderOtelHealth
 from SiteRMLibs.OtelMetrics import initMetrics
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
@@ -562,6 +563,10 @@ class PromOut:
         self.__diskStats(registry)
         self.__getSwitchErrors(registry)
         self.__getActiveQoSStates(registry)
+        # Health of the export path itself, on the pull path deliberately: a
+        # metric saying "telemetry is not reaching the gateway" must not travel
+        # over the path that is broken.
+        renderOtelHealth(registry)
 
     def metrics(self):
         """Return all available Hosts, where key is IP address."""
