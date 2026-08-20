@@ -25,7 +25,9 @@ import sys
 
 from easysnmp import Session
 from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDError
-from prometheus_client import CollectorRegistry, Enum, Gauge, Info, generate_latest
+from prometheus_client import CollectorRegistry, generate_latest
+from SiteRMLibs.MetricsBridge import DualEnum, DualGauge, DualInfo
+from SiteRMLibs.OtelMetrics import initMetrics
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
 from SiteRMLibs.GitConfig import getGitConfig
@@ -289,6 +291,11 @@ class PromOut:
             "Hostname": "",
         }
         self.snmpdir = os.path.join(self.config.get(sitename, "privatedir"), "SNMPData")
+        # The meter provider lives in THIS process, not the REST process: the
+        # REST layer only serves the snmpinfo.txt this class writes. Building it
+        # here is what gives the DualGauge/DualInfo/DualEnum instruments
+        # somewhere to record, and it is idempotent.
+        initMetrics("siterm-snmpmon")
 
     @staticmethod
     def __cleanRegistry():
@@ -302,7 +309,7 @@ class PromOut:
 
     def __memStats(self, registry):
         """Refresh all Memory Statistics in FE"""
-        memInfo = Gauge(
+        memInfo = DualGauge(
             "memory_usage",
             "Memory Usage for Service",
             ["servicename", "key", "hostname"],
@@ -320,7 +327,7 @@ class PromOut:
 
     def __diskStats(self, registry):
         """Refresh all Disk Statistics in FE"""
-        diskGauge = Gauge(
+        diskGauge = DualGauge(
             "disk_usage",
             "Disk usage statistics for each filesystem",
             ["filesystem", "key", "hostname"],
@@ -351,13 +358,13 @@ class PromOut:
 
     def __getAgentData(self, registry):
         """Add Agent Data (Cert validity) to prometheus output"""
-        agentCertValid = Gauge(
+        agentCertValid = DualGauge(
             "agent_cert",
             "Agent Certificate Validity",
             ["hostname", "Key"],
             registry=registry,
         )
-        arpState = Gauge(
+        arpState = DualGauge(
             "arp_state",
             "ARP Address Table for Host",
             labelnames=self.arpLabels.keys(),
@@ -378,7 +385,7 @@ class PromOut:
     def __getSwitchErrors(self, registry):
         """Add Switch Errors to prometheus output"""
         dbOut = self.dbI.get("switch")
-        switchErrorsGauge = Gauge(
+        switchErrorsGauge = DualGauge(
             "switch_errors",
             "Switch Errors",
             ["hostname", "errortype"],
@@ -397,13 +404,13 @@ class PromOut:
         snmpData = self.dbI.get("snmpmon")
         if not snmpData:
             return
-        snmpGauge = Gauge(
+        snmpGauge = DualGauge(
             "interface_statistics",
             "Interface Statistics",
             ["ifDescr", "ifType", "ifAlias", "hostname", "Key"],
             registry=registry,
         )
-        macState = Info(
+        macState = DualInfo(
             "mac_table",
             "Mac Address Table",
             labelnames=["vlan", "hostname", "incr"],
@@ -476,7 +483,7 @@ class PromOut:
                 out[key] = item.get(key, "")
             return out
 
-        netState = Enum(
+        netState = DualEnum(
             "network_status",
             "Network Status information",
             labelnames=labelnames,
@@ -491,7 +498,7 @@ class PromOut:
             ],
             registry=registry,
         )
-        qosGauge = Gauge("qos_status", "QoS Requests Status", labelqos, registry=registry)
+        qosGauge = DualGauge("qos_status", "QoS Requests Status", labelqos, registry=registry)
 
         currentActive = getActiveDeltas(self)
         for item in self.activeAPI.generateReport(currentActive):
@@ -513,20 +520,20 @@ class PromOut:
 
     def __getServiceStates(self, registry):
         """Get all Services states."""
-        serviceState = Enum(
+        serviceState = DualEnum(
             "service_state",
             "Description of enum",
             labelnames=["servicename", "hostname"],
             states=["OK", "WARNING", "UNKNOWN", "FAILED", "KEYBOARDINTERRUPT", "UNSET"],
             registry=registry,
         )
-        runtimeInfo = Gauge(
+        runtimeInfo = DualGauge(
             "service_runtime",
             "Service Runtime",
             ["servicename", "hostname"],
             registry=registry,
         )
-        infoState = Info(
+        infoState = DualInfo(
             "running_version",
             "Running Code Version.",
             labelnames=["servicename", "hostname"],
