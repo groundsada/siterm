@@ -21,8 +21,8 @@ import ansible_runner
 import yaml
 from SiteRMLibs.Backends import parsers
 from SiteRMLibs.CustomExceptions import ConfigException
-from SiteRMLibs.MainUtilities import getLoggingObject, withTimeout
-from SiteRMLibs.OtelMetrics import getCounter, getHistogram
+from SiteRMLibs.MainUtilities import getLoggingObject, getUTCnow, withTimeout
+from SiteRMLibs.OtelMetrics import getCounter, getGauge, getHistogram
 from SiteRMLibs.OtelWrapper import getTracer, traceparent
 
 _ansible_tracer = getTracer("siterm.ansible")
@@ -45,9 +45,29 @@ class Switch:
         """Activating state actions."""
         return True
 
+    @staticmethod
+    def _recordReachability(ansOut):
+        """Report which switches answered at all.
+
+        `dark` is ansible's unreachable bucket, and it is a different thing from
+        `failures`: a switch that cannot be reached runs no tasks and reports no
+        errors, so switch_errors stays silent and it is indistinguishable from a
+        quiet, healthy switch. Reachable hosts are set to 0 rather than left
+        absent, so the series exists to be alerted on.
+        """
+        if not ansOut or not ansOut.stats:
+            return
+        unreachable = getGauge("siterm_switch_unreachable", "1 when ansible could not reach this switch")
+        for key in ["ok", "failures"]:
+            for host in ansOut.stats.get(key, {}):
+                unreachable.set(0, {"hostname": host})
+        for host in ansOut.stats.get("dark", {}):
+            unreachable.set(1, {"hostname": host})
+
     def getAnsErrors(self, ansOut):
         """Get Ansible errors"""
         failures = False
+        self._recordReachability(ansOut)
         if not ansOut or not ansOut.stats:
             return failures
         for fkey in ["dark", "failures"]:
@@ -223,8 +243,23 @@ class Switch:
                 time.sleep(5)
                 self.verbosity = 7
                 continue
+            self._recordConfigApplied(ansOut)
             retries = 0
         return ansOut, self.ansibleErrs
+
+    @staticmethod
+    def _recordConfigApplied(ansOut):
+        """Stamp when config last actually landed, per switch.
+
+        Nothing else distinguishes "applied 30s ago" from "last applied before
+        the outage" -- the config itself looks the same either way.
+        """
+        if not ansOut or not ansOut.stats:
+            return
+        applied = getGauge("siterm_switch_config_applied_timestamp_seconds", "When configuration last applied cleanly to this switch")
+        now = getUTCnow()
+        for host in ansOut.stats.get("ok", {}):
+            applied.set(now, {"hostname": host})
 
     def _getFacts(self, hosts=None, subitem=""):
         """Get All Facts for all Ansible Hosts"""
