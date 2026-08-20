@@ -14,7 +14,7 @@ import os
 from SiteRMLibs import __version__
 from SiteRMLibs.MainUtilities import loadEnvFile
 from SiteRMLibs.OtelExporters import buildExporter
-from SiteRMLibs.OtelWrapper import OTEL_AVAILABLE, envBool, otelEnabled
+from SiteRMLibs.OtelWrapper import OTEL_AVAILABLE, otelEnabled
 
 try:  # pragma: no cover - import guard, see module docstring
     from opentelemetry import trace

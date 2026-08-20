@@ -31,6 +31,12 @@ jobs:
           # the working tree, so it never needs the credential.
           persist-credentials: false
 
+      # The CI pylint config is generated from standarts/pylintrc, which stays
+      # strict for developers. Editing one without regenerating the other is
+      # how the two silently diverge.
+      - name: Check the generated pylint config is current
+        run: ./standarts/gen-ci-pylintrc.py --check
+
       - name: Super-linter
         uses: super-linter/super-linter/slim@4ce20838b8ab83717e78138c5b3a1407148e0918 # v8.7.0
         env:

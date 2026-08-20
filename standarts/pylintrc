@@ -1,5 +1,11 @@
 [MASTER]
 
+# Put the source root on sys.path so first-party imports resolve. Without this
+# every `from SiteRMLibs...` is an unresolvable import and import-error is only
+# useful if it is disabled -- which is how it came to be disabled for everyone.
+# Assumes pylint is run from the repository root, which is how CI runs it.
+init-hook='import os, sys; sys.path.insert(0, os.path.join(os.getcwd(), "src/python"))'
+
 # A comma-separated list of package or module names from where C extensions may
 # be loaded. Extensions are loading into the active Python interpreter and may
 # run arbitrary code.
@@ -90,13 +96,8 @@ disable=raw-checker-failed,
         broad-exception-raised,
         broad-exception-caught,
         C0103, R0801,
-        # Super-linter (which reads this file via the
-        # .github/linters/.python-lint symlink) runs pylint in a container
-        # without the project's dependencies installed and without src/python
-        # on the path, so every third-party and first-party import is
-        # unresolvable. These three fire on the environment, not the code.
-        import-error,
-        no-name-in-module,
+        # Optional-dependency guards import inside a function on purpose, so
+        # that a missing package costs one feature rather than the import.
         import-outside-toplevel,
         # The tree sorts imports alphabetically (SiteRMLibs before sqlalchemy);
         # pylint's third-party-before-first-party grouping disagrees.

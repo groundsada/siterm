@@ -16,7 +16,6 @@ this runs in CI with the packages installed. Needs no frontend and no network.
     python3 -m unittest test-otel -v
 """
 
-import builtins
 import importlib
 import logging
 import os
@@ -28,6 +27,8 @@ import unittest
 class _Blocker:
     """Import hook that makes chosen top-level packages unimportable."""
 
+    # pylint: disable=unused-argument
+
     def __init__(self, *prefixes):
         self.prefixes = prefixes
 
@@ -36,11 +37,14 @@ class _Blocker:
         return self.find_spec(fullname, path)
 
     def find_spec(self, fullname, path=None, target=None):
-        """Raise for anything under a blocked prefix."""
+        """Raise for anything under a blocked prefix.
+
+        Falling off the end returns None, which is how a meta_path finder says
+        "not mine" and lets the real import machinery run.
+        """
         for prefix in self.prefixes:
             if fullname == prefix or fullname.startswith(prefix + "."):
                 raise ImportError(f"blocked for test: {fullname}")
-        return None
 
 
 class _Hidden:
@@ -214,7 +218,13 @@ class TraceparentTestCase(unittest.TestCase):
 
 
 class ExporterConstructionTestCase(unittest.TestCase):
-    """What reaches the SDK exporter, which is the behaviour behind #11 and #15."""
+    """What reaches the SDK exporter, which is the behaviour behind #11 and #15.
+
+    Reaches into module privates on purpose: the kwargs handed to the SDK are
+    the behaviour under test, and there is no public seam that exposes them.
+    """
+
+    # pylint: disable=protected-access
 
     VARS = (
         "OTLP_INSECURE",
