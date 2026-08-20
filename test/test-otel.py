@@ -20,6 +20,7 @@ import builtins
 import importlib
 import logging
 import os
+import re
 import sys
 import unittest
 
@@ -329,6 +330,50 @@ class LogExportTestCase(unittest.TestCase):
         self.otellogs.attachHandler(logger, "test")
         self.assertEqual(logger.handlers, before)
         self.otellogs.attachHandler(None, "test")
+
+
+class TraceCorrelationTestCase(unittest.TestCase):
+    """Log lines carry the active span's ids, and nothing when there is none."""
+
+    def setUp(self):
+        self.wrapper = importlib.import_module("SiteRMLibs.OtelWrapper")
+        if not self.wrapper.OTEL_AVAILABLE:
+            self.skipTest("opentelemetry not installed")
+        self.utils = importlib.import_module("SiteRMLibs.MainUtilities")
+
+    def testNoSpanMeansNoIds(self):
+        """None, not zeros: trace_id=0 correlates nothing and costs width."""
+        self.assertIsNone(self.wrapper.traceIds())
+
+    def testFormatterLeavesOutOfSpanLinesAlone(self):
+        """An uncorrelated line must stay byte-identical to the old format."""
+        formatter = self.utils.buildFormatter()
+        record = logging.LogRecord("svc", logging.INFO, __file__, 1, "hello", None, None)
+        self.assertTrue(formatter.format(record).endswith("hello"))
+
+    def testInSpanIdsAreTheActiveSpans(self):
+        """The ids appended must be the ones Tempo will have stored."""
+        module = importlib.import_module("SiteRMLibs.OpenTelemetry")
+        if not module.OTEL_SDK_AVAILABLE:
+            self.skipTest("opentelemetry sdk not installed")
+        from opentelemetry.sdk.trace import TracerProvider
+
+        provider = TracerProvider()
+        tracer = provider.get_tracer("test")
+        formatter = self.utils.buildFormatter()
+        with tracer.start_as_current_span("poll") as span:
+            ids = self.wrapper.traceIds()
+            self.assertIsNotNone(ids)
+            self.assertEqual(ids[0], f"{span.get_span_context().trace_id:032x}")
+            self.assertEqual(ids[1], f"{span.get_span_context().span_id:016x}")
+
+            record = logging.LogRecord("svc", logging.INFO, __file__, 1, "hello", None, None)
+            line = formatter.format(record)
+            # The regex Grafana's Loki->Tempo derived field matches on.
+            found = re.search(r"trace_id=(\w+)", line)
+            self.assertIsNotNone(found)
+            self.assertEqual(found.group(1), ids[0])
+        self.assertIsNone(self.wrapper.traceIds())
 
 
 class ResourceTestCase(unittest.TestCase):

@@ -39,6 +39,7 @@ from SiteRMLibs.CustomExceptions import (
     WrongInputError,
 )
 from SiteRMLibs.DBBackend import dbinterface
+from SiteRMLibs.OtelWrapper import traceIds
 from yaml import safe_load as yload
 
 HOSTSERVICES = [
@@ -186,6 +187,34 @@ LEVELS = {
 }
 
 
+class TraceFormatter(logging.Formatter):
+    """Log formatter that appends trace context when a span is recording.
+
+    Appended rather than templated into the format string: a line emitted
+    outside any span stays byte-identical to what SiteRM logged before, so
+    existing log parsing is unaffected and only correlated lines get wider.
+
+    The rendered shape is what Grafana's Loki->Tempo derived field matches on,
+    `trace_id=(\\w+)`. Changing it breaks the pivot silently.
+    """
+
+    def format(self, record):
+        """Format, then append trace ids if there are any."""
+        line = super().format(record)
+        ids = traceIds()
+        if ids is None:
+            return line
+        return f"{line} [trace_id={ids[0]} span_id={ids[1]}]"
+
+
+def buildFormatter():
+    """The SiteRM log format, trace-aware."""
+    return TraceFormatter(
+        "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
+        datefmt="%a, %d %b %Y %H:%M:%S",
+    )
+
+
 def attachOtelLogHandler(logger, service):
     """Add the OTLP log handler, when the otel packages are installed and on.
 
@@ -208,11 +237,7 @@ def getStreamLogger(**kwargs):
     logger = logging.getLogger(kwargs.get("service", __name__))
     if not handler:
         handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%a, %d %b %Y %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
+        handler.setFormatter(buildFormatter())
     if not logger.handlers:
         logger.addHandler(handler)
     logger.setLevel(LEVELS[kwargs.get("logLevel", "DEBUG")])
@@ -250,11 +275,7 @@ def getTimeRotLogger(**kwargs):
             when=kwargs.get("rotateTime", "midnight"),
             backupCount=kwargs.get("backupCount", 5),
         )
-        formatter = logging.Formatter(
-            "%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s",
-            datefmt="%a, %d %b %Y %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
+        handler.setFormatter(buildFormatter())
         handler.setLevel(LEVELS[kwargs.get("logLevel", "DEBUG")])
         logger.addHandler(handler)
     logger.setLevel(LEVELS[kwargs.get("logLevel", "DEBUG")])

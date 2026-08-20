@@ -140,6 +140,21 @@ def traceparent():
     return carrier.get("traceparent", "")
 
 
+def traceIds():
+    """(trace_id, span_id) as hex, or None when no span is recording.
+
+    None rather than zeros. `trace_id=0` correlates nothing and still costs the
+    width on every line of every log file, which is what made the previous
+    LoggingInstrumentor format not worth having.
+    """
+    if not OTEL_AVAILABLE:
+        return None
+    ctx = _trace.get_current_span().get_span_context()
+    if ctx is None or not ctx.is_valid:
+        return None
+    return f"{ctx.trace_id:032x}", f"{ctx.span_id:016x}"
+
+
 def spanContextFromTraceparent(tphdr):
     """Remote parent SpanContext from a W3C traceparent, or None if unusable."""
     if not OTEL_AVAILABLE or not tphdr:
@@ -196,18 +211,24 @@ def setSpanStatus(span, status):
 
 
 def instrumentLogging():
-    """Add trace ids to log records, when tracing is on.
+    """Put otelTraceID and otelSpanID on every log record, when tracing is on.
 
     Gated on otelEnabled(). Previously this ran unconditionally, so a deployment
     with the packages installed but tracing off still had its logging format
     rewritten to carry trace_id=0 on every line -- correlating nothing while
     making every log line wider.
+
+    `set_logging_format=False` because True calls logging.basicConfig, which
+    only touches the root logger. Every SiteRM logger carries its own handler
+    and formatter, so the rewrite reached none of them and the file logs had no
+    trace ids at all. MainUtilities.TraceFormatter is what actually renders
+    them, and only when a span is recording.
     """
     if not otelEnabled():
         return
     try:
         from opentelemetry.instrumentation.logging import LoggingInstrumentor
 
-        LoggingInstrumentor().instrument(set_logging_format=True)
+        LoggingInstrumentor().instrument(set_logging_format=False)
     except Exception as ex:  # pragma: no cover
         print(f"OpenTelemetry logging instrumentation skipped. Error: {ex}")
