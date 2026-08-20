@@ -194,8 +194,46 @@ def getHistogram(name, description="", meterName="siterm"):
 
 
 def getGauge(name, description="", meterName="siterm"):
-    """Synchronous gauge, for last-known-value signals."""
+    """Synchronous gauge, for last-known-value signals.
+
+    Keeps reporting every attribute set it has ever been given, for the life of
+    the process. Fine for a bounded label set; use getObservableGauge when the
+    labels come and go.
+    """
     return _instrument("gauge", name, description, "", meterName)
+
+
+def getObservableGauge(name, callback, description="", meterName="siterm"):
+    """Async gauge reporting exactly what `callback` returns at each collection.
+
+    The difference that matters: an attribute set the callback stops returning
+    stops being reported. A synchronous gauge would keep emitting it forever,
+    so a label like a delta id would accumulate without bound no matter how few
+    are written per cycle.
+
+    `callback` takes the SDK's CallbackOptions and yields Observation.
+    """
+    if not metricsEnabled():
+        return None
+    meter = getMeter(meterName)
+    if meter is None:
+        return None
+    key = ("observablegauge", name)
+    with _LOCK:
+        if key in _INSTRUMENTS:
+            return _INSTRUMENTS[key]
+        inst = meter.create_observable_gauge(name, callbacks=[callback], unit="", description=description)
+        _INSTRUMENTS[key] = inst
+        return inst
+
+
+def observation(value, attributes):
+    """An Observation, or None when the SDK is absent."""
+    if not OTEL_METRICS_AVAILABLE:
+        return None
+    from opentelemetry.metrics import Observation
+
+    return Observation(value, attributes)
 
 
 def shutdownMetrics():

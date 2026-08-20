@@ -32,6 +32,7 @@ from SiteRMLibs.OtelHealth import renderInto as renderOtelHealth
 from SiteRMLibs.OtelMetrics import getHistogram, initMetrics
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
+from SiteRMLibs.DeltaMetrics import DeltaMetrics
 from SiteRMLibs.GitConfig import getGitConfig
 from SiteRMLibs.MainUtilities import (
     contentDB,
@@ -298,6 +299,9 @@ class PromOut:
         # here is what gives the DualGauge/DualInfo/DualEnum instruments
         # somewhere to record, and it is idempotent.
         initMetrics("siterm-snmpmon")
+        # Delta lifecycle, derived from the append-only state history. Placed in
+        # this cycle so it reuses the existing cadence rather than adding one.
+        self.deltametrics = DeltaMetrics(self.dbI)
 
     @staticmethod
     def __cleanRegistry():
@@ -620,6 +624,7 @@ class PromOut:
         registry = self.__cleanRegistry()
         started = time.time()
         self.__getServiceStates(registry)
+        self.deltametrics.collect(self.timenow)
         self.__freshness(registry, started)
         data = generate_latest(registry)
         del registry  # Explicit dereference of Collector Registry
