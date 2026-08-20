@@ -127,6 +127,8 @@ def load_cert_info(cert):
 
 _CHALLENGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
+CHALLENGE_TTL = 60
+
 
 def get_challenge_record(challenge_id: str):
     """Retrieve a challenge record by its ID."""
@@ -136,6 +138,31 @@ def get_challenge_record(challenge_id: str):
     if not os.path.exists(tempfile):
         return None
     return getFileContentAsJson(tempfile)
+
+
+def sweep_challenges():
+    """Delete challenges past their TTL.
+
+    Nothing else removes them: verify_challenge deletes only the one it
+    consumed, so every challenge that is issued and never completed stays on
+    disk for the life of the container.
+    """
+    challengedir = f"{getTempDir()}/m2m"
+    if not os.path.isdir(challengedir):
+        return
+    cutoff = getUTCnow() - CHALLENGE_TTL
+    for fname in os.listdir(challengedir):
+        if not fname.endswith(".json"):
+            continue
+        fullpath = os.path.join(challengedir, fname)
+        try:
+            # mtime, not the record's expires_at: the file is written once at
+            # issue time, so this needs no read and cannot trip over a record
+            # left truncated by a crash mid-write.
+            if os.path.getmtime(fullpath) < cutoff:
+                os.unlink(fullpath)
+        except OSError:
+            continue
 
 
 def base64url_encode_nopad(b: bytes) -> str:
@@ -247,6 +274,7 @@ class AuthHandler:
         """Generate a challenge for the given certificate."""
         # Challenge storage is filesystem-based (tmp), that breaks if multiple instances are running
         # or if container is restarted
+        sweep_challenges()
         try:
             cert = load_cert(input_cert)
             verify_cert_chain(input_cert, self.oidc_ca_store)
@@ -259,7 +287,7 @@ class AuthHandler:
             challenge_id = secrets.token_hex(16)
 
             tempfile = f"{getTempDir()}/m2m/{challenge_id}.json"
-            expires_at = getUTCnow() + 60
+            expires_at = getUTCnow() + CHALLENGE_TTL
 
             dumpFileContentAsJson(
                 tempfile,
