@@ -22,6 +22,7 @@ Date: 2022/11/21
 import copy
 import os
 import sys
+import time
 
 from easysnmp import Session
 from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDError
@@ -371,8 +372,19 @@ class PromOut:
             labelnames=self.arpLabels.keys(),
             registry=registry,
         )
+        # Emitted before the timeout check, deliberately. Everything below
+        # disappears once a host goes quiet, so a stale host and a host that
+        # never existed look identical; this one series keeps saying how old
+        # the data is instead of vanishing with it.
+        hostLastSeen = DualGauge(
+            "siterm_host_last_seen_timestamp_seconds",
+            "When the agent on this host last reported",
+            ["hostname"],
+            registry=registry,
+        )
         for host, hostDict in getAllHosts(self.dbI).items():
             hostDict["hostinfo"] = self.diragent.getFileContentAsJson(hostDict["hostinfo"])
+            hostLastSeen.labels(hostname=host).set(hostDict["updatedate"])
             if int(self.timenow - hostDict["updatedate"]) > SERVICE_DOWN_TIMEOUT:
                 self.logger.warning(f"Host {host} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
                 continue
@@ -417,7 +429,16 @@ class PromOut:
             labelnames=["vlan", "hostname", "incr"],
             registry=registry,
         )
+        # Same reason as siterm_host_last_seen_timestamp_seconds: emitted above
+        # the timeout so a switch that stopped answering stays visible.
+        snmpLastPoll = DualGauge(
+            "siterm_snmp_last_poll_timestamp_seconds",
+            "When SNMP data for this device was last collected",
+            ["hostname"],
+            registry=registry,
+        )
         for item in snmpData:
+            snmpLastPoll.labels(hostname=item["hostname"]).set(item["updatedate"])
             if int(self.timenow - item["updatedate"]) > SERVICE_DOWN_TIMEOUT:
                 self.logger.warning(f"SNMP {item['hostname']} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
                 continue
@@ -568,11 +589,34 @@ class PromOut:
         # over the path that is broken.
         renderOtelHealth(registry)
 
+    def __freshness(self, registry, started):
+        """When this file was built, and how long that took.
+
+        Scrape freshness is not data freshness. The REST layer serves the
+        snmpinfo.txt this class writes, so a scrape succeeds at the usual
+        interval whether or not anything is still updating the file -- and a
+        panel cannot tell a real 0 from an exporter that died 40 minutes ago.
+        """
+        generated = DualGauge(
+            "siterm_metrics_generated_timestamp_seconds",
+            "When the metrics file was last built",
+            registry=registry,
+        )
+        generated.set(self.timenow)
+        duration = DualGauge(
+            "siterm_exporter_build_duration_seconds",
+            "How long the last metrics build took",
+            registry=registry,
+        )
+        duration.set(time.time() - started)
+
     def metrics(self):
         """Return all available Hosts, where key is IP address."""
         self.refreshTimeNow()
         registry = self.__cleanRegistry()
+        started = time.time()
         self.__getServiceStates(registry)
+        self.__freshness(registry, started)
         data = generate_latest(registry)
         del registry  # Explicit dereference of Collector Registry
         fname = os.path.join(self.snmpdir, "snmpinfo.txt")

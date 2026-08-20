@@ -52,15 +52,25 @@ class _BoundGauge:
 class DualGauge:
     """A prometheus_client Gauge that also feeds an OTel gauge."""
 
-    # pylint: disable=too-few-public-methods
-
     def __init__(self, name, documentation, labelnames=(), registry=None):
         self._prom = Gauge(name, documentation, labelnames, registry=registry)
         self._otel = getGauge(name, documentation)
+        self._labelnames = tuple(labelnames)
 
     def labels(self, **labels):
         """Bind a label set."""
         return _BoundGauge(self._prom.labels(**labels), self._otel, labels)
+
+    def set(self, value):
+        """Set an unlabelled gauge on both paths.
+
+        prometheus_client refuses labels() on a gauge with no label names, so a
+        process-wide signal has to be set directly rather than through a bind.
+        """
+        if self._labelnames:
+            raise ValueError("gauge has labels; call labels() first")
+        self._prom.set(value)
+        self._otel.set(value, {})
 
 
 class _BoundInfo:
