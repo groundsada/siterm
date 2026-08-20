@@ -5,6 +5,13 @@ Protocol comes from OTEL_EXPORTER_OTLP_PROTOCOL or the endpoint scheme; HTTP is
 the default off-NRP because gRPC's end-to-end HTTP/2 does not survive a proxy
 that re-originates TLS. Signal paths are appended so a site configures one URL.
 Both transports refresh the bearer token without rebuilding the exporter.
+
+    OTLP_CA_BUNDLE    CA file used to verify the collector
+    OTLP_CLIENT_CERT  client certificate, for mTLS
+    OTLP_CLIENT_KEY   its key
+
+Unset means the system trust store and no client certificate, so a site that
+does not need any of this configures none of it.
 """
 
 import os
@@ -62,16 +69,46 @@ def _insecure(endpoint):
     return None
 
 
+def _readable(path, name):
+    """`path` if it can be read, otherwise None and a warning.
+
+    Checked once at startup rather than left to the transport, which reports a
+    missing trust file as an opaque handshake failure on every export.
+    """
+    if not path:
+        return None
+    if os.access(path, os.R_OK):
+        return path
+    print(f"OpenTelemetry: {name}={path} is not readable. Ignoring it.")
+    return None
+
+
+def tlsMaterial():
+    """(caBundle, clientCert, clientKey) paths, each None when unset."""
+    ca = _readable(os.getenv("OTLP_CA_BUNDLE"), "OTLP_CA_BUNDLE")
+    cert = _readable(os.getenv("OTLP_CLIENT_CERT"), "OTLP_CLIENT_CERT")
+    key = _readable(os.getenv("OTLP_CLIENT_KEY"), "OTLP_CLIENT_KEY")
+    if bool(cert) != bool(key):
+        print("OpenTelemetry: OTLP_CLIENT_CERT and OTLP_CLIENT_KEY must both be set for mTLS. Ignoring both.")
+        cert = key = None
+    return ca, cert, key
+
+
 class _AuthSession:
     """requests.Session that stamps a fresh bearer token on every request.
 
     A static `headers` dict would pin the startup token and fail an hour later.
     """
 
-    def __new__(cls, tokenSource, signal):
+    def __new__(cls, tokenSource, signal, tls=(None, None, None)):
         import requests  # local: keep module import cheap when otel is absent
 
         session = requests.Session()
+        ca, cert, key = tls
+        if ca:
+            session.verify = ca
+        if cert and key:
+            session.cert = (cert, key)
         original = session.request
 
         def request(method, url, **kwargs):
@@ -88,11 +125,25 @@ class _AuthSession:
         return session
 
 
-def _grpcCredentials(tokenSource, insecure):
-    """Channel credentials carrying a per-RPC bearer token, or None.
+def _pem(path):
+    """PEM bytes from `path`, or None. grpc wants bytes where requests wants a path."""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fd:
+            return fd.read()
+    except OSError as ex:  # pragma: no cover
+        print(f"OpenTelemetry: cannot read {path}. Error: {ex}")
+        return None
 
-    grpc resolves these on every RPC, so the token refreshes without rebuilding
-    the channel. It refuses to attach them to a plaintext channel, hence None.
+
+def _grpcCredentials(tokenSource, insecure):
+    """Channel credentials for the gRPC exporter, or None to leave it to the SDK.
+
+    Carries the trust material and, when auth is configured, a per-RPC bearer
+    token: grpc resolves the token on every RPC, so it refreshes without
+    rebuilding the channel. It refuses to attach one to a plaintext channel,
+    hence None there.
     """
     if insecure:
         return None
@@ -100,6 +151,18 @@ def _grpcCredentials(tokenSource, insecure):
         import grpc
     except ImportError:  # pragma: no cover
         return None
+
+    ca, cert, key = tlsMaterial()
+    if not tokenSource.configured() and not any((ca, cert, key)):
+        return None
+
+    channel = grpc.ssl_channel_credentials(
+        root_certificates=_pem(ca),
+        private_key=_pem(key),
+        certificate_chain=_pem(cert),
+    )
+    if not tokenSource.configured():
+        return channel
 
     class _Plugin(grpc.AuthMetadataPlugin):
         """Supplies the Authorization header for each call."""
@@ -109,10 +172,7 @@ def _grpcCredentials(tokenSource, insecure):
             metadata = (("authorization", f"Bearer {token}"),) if token else ()
             callback(metadata, None)
 
-    return grpc.composite_channel_credentials(
-        grpc.ssl_channel_credentials(),
-        grpc.metadata_call_credentials(_Plugin()),
-    )
+    return grpc.composite_channel_credentials(channel, grpc.metadata_call_credentials(_Plugin()))
 
 
 def buildExporter(signal, endpoint, tokenSource=None):
@@ -137,8 +197,9 @@ def buildExporter(signal, endpoint, tokenSource=None):
             print(f"OpenTelemetry OTLP/HTTP exporter unavailable for {signal}. Error: {ex}")
             return None
         kwargs = {"endpoint": signalEndpoint(endpoint, signal)}
-        if tokenSource.configured():
-            kwargs["session"] = _AuthSession(tokenSource, signal)
+        tls = tlsMaterial()
+        if tokenSource.configured() or any(tls):
+            kwargs["session"] = _AuthSession(tokenSource, signal, tls)
         return CountingExporter(Exporter(**kwargs), signal)
 
     try:
@@ -156,17 +217,16 @@ def buildExporter(signal, endpoint, tokenSource=None):
     insecure = _insecure(endpoint)
     if insecure is not None:
         kwargs["insecure"] = insecure
-    if tokenSource.configured():
-        credentials = _grpcCredentials(tokenSource, insecure)
-        if credentials is not None:
-            kwargs["credentials"] = credentials
-            kwargs.pop("insecure", None)
-        else:
-            # Loud, because the alternative is 401 on every batch surfacing only
-            # as a generic export failure.
-            print(
-                f"OpenTelemetry: OTLP auth is configured but endpoint {endpoint} is plaintext gRPC. "
-                "gRPC cannot carry a bearer token without TLS. Use the OTLP/HTTP endpoint "
-                "(port 4318) or a TLS gRPC endpoint. Exporting unauthenticated."
-            )
+    credentials = _grpcCredentials(tokenSource, insecure)
+    if credentials is not None:
+        kwargs["credentials"] = credentials
+        kwargs.pop("insecure", None)
+    elif tokenSource.configured():
+        # Loud, because the alternative is 401 on every batch surfacing only
+        # as a generic export failure.
+        print(
+            f"OpenTelemetry: OTLP auth is configured but endpoint {endpoint} is plaintext gRPC. "
+            "gRPC cannot carry a bearer token without TLS. Use the OTLP/HTTP endpoint "
+            "(port 4318) or a TLS gRPC endpoint. Exporting unauthenticated."
+        )
     return CountingExporter(Exporter(**kwargs), signal)
