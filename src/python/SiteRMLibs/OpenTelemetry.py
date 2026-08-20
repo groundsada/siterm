@@ -41,8 +41,18 @@ def buildResource(service_name):
 
     `sitename` is deliberately absent: the gateway stamps it from the verified
     credential and overwrites anything sent.
+
+    `siterm.component` is one of Loki's three index labels and nothing was
+    setting it. It defaults to the daemon name, which is bounded; SITERM_COMPONENT
+    overrides it for a deployment that wants to group daemons by role instead.
     """
-    return Resource.create({"service.name": service_name, "service.version": __version__})
+    return Resource.create(
+        {
+            "service.name": service_name,
+            "service.version": __version__,
+            "siterm.component": os.getenv("SITERM_COMPONENT") or service_name,
+        }
+    )
 
 
 def _sampler():

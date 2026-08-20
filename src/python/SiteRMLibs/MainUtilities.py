@@ -186,6 +186,21 @@ LEVELS = {
 }
 
 
+def attachOtelLogHandler(logger, service):
+    """Add the OTLP log handler, when the otel packages are installed and on.
+
+    Imported here rather than at module scope: SiteRMLibs.OtelLogs reaches back
+    into this module for the resource, and every SiteRM component imports this
+    one.
+    """
+    try:
+        from SiteRMLibs.OtelLogs import attachHandler
+
+        attachHandler(logger, service)
+    except ImportError:
+        pass
+
+
 def getStreamLogger(**kwargs):
     """Get Stream Logger."""
     kwargs["handler"] = logging.StreamHandler
@@ -207,8 +222,13 @@ def getStreamLogger(**kwargs):
 def getLoggingObject(**kwargs):
     """Get logging Object, either Timed FD or Stream"""
     if kwargs.get("logType", "TimedRotatingFileHandler") == "TimedRotatingFileHandler":
-        return getTimeRotLogger(**kwargs)
-    return getStreamLogger(**kwargs)
+        logger = getTimeRotLogger(**kwargs)
+    else:
+        logger = getStreamLogger(**kwargs)
+    # After, not before: getStreamLogger only adds its handler to a logger that
+    # has none, so attaching this first would take the file handler away.
+    attachOtelLogHandler(logger, kwargs.get("service", __name__))
+    return logger
 
 
 def getTimeRotLogger(**kwargs):
