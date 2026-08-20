@@ -9,4 +9,7 @@
 #### CodeFactor
 [![CodeFactor](https://www.codefactor.io/repository/github/sdn-sense/siterm/badge)](https://www.codefactor.io/repository/github/sdn-sense/siterm)
 
+#### Documentation
+* [OpenTelemetry](docs/opentelemetry.md) — optional trace, metric and log export over OTLP
+
 
