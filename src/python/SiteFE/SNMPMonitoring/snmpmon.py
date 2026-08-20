@@ -411,6 +411,20 @@ class PromOut:
                     labels = {"errortype": errorkey, "hostname": item["device"]}
                     switchErrorsGauge.labels(**labels).set(len(errors))
 
+    @staticmethod
+    def _addMacTable(macState, hostname, val):
+        """Emit one mac_table series per address, numbered within its vlan.
+
+        The isinstance guard keeps the old `"vlans" in val` behaviour: that test
+        is False rather than an error when the payload is not a mapping.
+        """
+        if not isinstance(val, dict):
+            return
+        for vlan, macs in val.get("vlans", {}).items():
+            for incr, macaddr in enumerate(macs):
+                labels = {"vlan": vlan, "hostname": hostname, "incr": str(incr)}
+                macState.labels(**labels).info({"macaddress": macaddr})
+
     def __getSNMPData(self, registry):
         """Add SNMP Data to prometheus output"""
         # Here get info from DB for switch snmp details
@@ -452,17 +466,7 @@ class PromOut:
                 continue
             for key, val in out.items():
                 if key == "macs":
-                    if "vlans" in val:
-                        for key1, macs in val["vlans"].items():
-                            incr = 0
-                            for macaddr in macs:
-                                labels = {
-                                    "vlan": key1,
-                                    "hostname": item["hostname"],
-                                    "incr": str(incr),
-                                }
-                                macState.labels(**labels).info({"macaddress": macaddr})
-                                incr += 1
+                    self._addMacTable(macState, item["hostname"], val)
                     continue
                 keys = {
                     "ifDescr": val.get("ifDescr", ""),
