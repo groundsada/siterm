@@ -11,10 +11,12 @@ Date: 2023/03/17
 
 import traceback
 
-from prometheus_client import CollectorRegistry, Gauge, Info, push_to_gateway
+from prometheus_client import CollectorRegistry, push_to_gateway
 from SiteRMLibs.BaseDebugAction import BaseDebugAction
 from SiteRMLibs.GitConfig import getGitConfig
 from SiteRMLibs.MainUtilities import evaldict, getDBConn, getVal, isValFloat
+from SiteRMLibs.MetricsBridge import DualGauge, DualInfo
+from SiteRMLibs.OtelMetrics import initMetrics
 
 
 class PromPush(BaseDebugAction):
@@ -101,13 +103,16 @@ class PromPush(BaseDebugAction):
         registry = self.__cleanRegistry()
         # Get info from DB
         snmpData = self.dbI.get("snmpmon", limit=1, search=[["hostname", hostname]])
-        snmpGauge = Gauge(
+        # Same two series snmpmon emits, from the same switch data. The push
+        # gateway output is unchanged; the meter provider gets a second copy.
+        initMetrics("siterm-prompush")
+        snmpGauge = DualGauge(
             "interface_statistics",
             "Interface Statistics",
             self.promLabels.keys(),
             registry=registry,
         )
-        macState = Info(
+        macState = DualInfo(
             "mac_table",
             "Mac Address Table",
             labelnames=self.snmpLabels.keys(),

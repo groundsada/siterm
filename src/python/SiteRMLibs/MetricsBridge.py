@@ -19,6 +19,20 @@ from prometheus_client import Enum, Gauge, Info
 from SiteRMLibs.OtelMetrics import getGauge
 
 
+def _attrs(labels, extra=None):
+    """Label dict as OTel attributes, with every value a string.
+
+    prometheus_client stringifies label values on the way out, so an int label
+    -- PromPush passes the mac index as one -- would otherwise reach Mimir as an
+    OTLP int attribute and the two paths would disagree on the type even where
+    they agree on the text.
+    """
+    out = {key: str(val) for key, val in labels.items()}
+    if extra:
+        out.update({key: str(val) for key, val in extra.items()})
+    return out
+
+
 class _BoundGauge:
     """One label set of a DualGauge."""
 
@@ -32,7 +46,7 @@ class _BoundGauge:
     def set(self, value):
         """Set both paths."""
         self._prom.set(value)
-        self._otel.set(value, self._labels)
+        self._otel.set(value, _attrs(self._labels))
 
 
 class DualGauge:
@@ -66,9 +80,7 @@ class _BoundInfo:
         gauge fixed at 1 with the payload merged into the labels.
         """
         self._prom.info(payload)
-        attrs = dict(self._labels)
-        attrs.update(payload)
-        self._otel.set(1, attrs)
+        self._otel.set(1, _attrs(self._labels, payload))
 
 
 class DualInfo:
@@ -105,9 +117,7 @@ class _BoundEnum:
         """
         self._prom.state(value)
         for state in self._states:
-            attrs = dict(self._labels)
-            attrs[self._name] = state
-            self._otel.set(1 if state == value else 0, attrs)
+            self._otel.set(1 if state == value else 0, _attrs(self._labels, {self._name: state}))
 
 
 class DualEnum:
