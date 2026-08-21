@@ -231,6 +231,54 @@ def client_ip_allowed(client_ip, allowed_ips):
     return False
 
 
+DEFAULT_PORTS = {"https": "443", "http": "80"}
+
+
+def normalizeIssuer(issuer, derived=False):
+    """The issuer URL with the parts a relying party cannot be asked to guess.
+
+    A relying party compares this string to the token's `iss` claim byte for
+    byte, so it has to be stable and it has to be a URL. Deriving it from
+    `general.webdomain` -- a value written to be read by humans -- makes it
+    neither, which is why the problems below are worth catching here rather
+    than in whatever is federating these frontends.
+
+    A trailing slash is removed. It is not cosmetic: `getOpenIDConfiguration`
+    builds `jwks_uri` and the token endpoints by concatenation, so one turns
+    them into `https://host//.well-known/jwks.json`, and it changes `iss`.
+
+    A scheme-default port is reported but NOT removed. `https://host:443` and
+    `https://host` denote the same authority, so stripping it would be correct
+    in the abstract. It is still the wrong thing to do silently: every relying
+    party already holds whichever string this frontend published before, a
+    fleet upgrades one site at a time, and nothing can hold both forms for one
+    site at once -- go-oidc rejects a provider whose configured URL differs
+    from the published one, and the OTel collector's oidc extension fails
+    startup entirely when any single provider fails. Changing the string is a
+    coordinated migration. Warning about it is not.
+    """
+    cleaned = (issuer or "").strip().rstrip("/")
+    if not cleaned:
+        return cleaned
+
+    scheme, _, rest = cleaned.partition("://")
+    if not rest:
+        print(f"OIDC: issuer {cleaned!r} has no scheme. It is a protocol identifier and must be an absolute https URL.")
+        return cleaned
+
+    host = rest.split("/", 1)[0]
+    _, sep, port = host.rpartition(":")
+    if sep and port == DEFAULT_PORTS.get(scheme):
+        source = "general.webdomain" if derived else "OIDC_ISSUER"
+        print(
+            f"OIDC: issuer {cleaned!r} carries the default port for {scheme}. "
+            f"It is published verbatim and every relying party must match it exactly, "
+            f"so consider setting OIDC_ISSUER without it (from {source}). "
+            f"Do not change it without re-registering with anything that federates this frontend."
+        )
+    return cleaned
+
+
 class AuthHandler:
     """Authentication handler to manage user/pass and token-based authentication."""
 
@@ -246,7 +294,10 @@ class AuthHandler:
         # OIDC and JWKS handling
         self.gitConf = getGitConfig()
         self.oidc_app_name = os.environ.get("OIDC_APP_NAME", "SITERM Token Issuer.")
-        self.oidc_issuer = os.environ.get("OIDC_ISSUER", self.gitConf.get("general", "webdomain"))
+        self.oidc_issuer = normalizeIssuer(
+            os.environ.get("OIDC_ISSUER", self.gitConf.get("general", "webdomain")),
+            derived="OIDC_ISSUER" not in os.environ,
+        )
         self.oidc_audience = os.environ.get("OIDC_AUDIENCE", self.gitConf.get("general", "webdomain"))
         self.oidc_extra_audience = os.environ.get("OIDC_EXTRA_AUDIENCE", "")
         self.oidc_sitename = os.environ.get("OIDC_SITENAME", self.gitConf.get("general", "sitename", ""))
