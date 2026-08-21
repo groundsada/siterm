@@ -48,7 +48,10 @@ from SiteRMLibs.MainUtilities import (
     jsondumps,
 )
 from SiteRMLibs.MemDiskStats import MemDiskStats
+from SiteRMLibs.OtelWrapper import getTracer, setSpanStatus, statusError
 from SiteRMLibs.Warnings import Warnings
+
+_snmp_tracer = getTracer("siterm.snmpmonitoring")
 
 
 class Topology:
@@ -803,6 +806,29 @@ class SNMPMonitoring(Warnings):
         self._writeToDB("hostnamedisk-fe", self.memdisk.getStorageInfo())
 
     def startwork(self):
+        """Scan all switches and get snmp data.
+
+        Only opens the span; _startwork does the polling. Kept separate for the
+        same reason as LookUpService -- so the span costs no reindent.
+
+        Per-switch timing is deliberately NOT a child span. It is already
+        siterm_snmp_poll_duration_seconds, labelled by hostname, and a span per
+        switch per cycle would carry the same answer at much higher volume.
+        """
+        with _snmp_tracer.start_as_current_span("snmp.poll") as span:
+            span.set_attribute("snmp.switch_count", len(self.switches or []))
+            try:
+                self._startwork()
+                # Switches configured but unreachable are the interesting gap:
+                # they produce no error here, they simply never get a session.
+                span.set_attribute("snmp.warning_count", len(self.lastrunwarnings or []))
+                return None
+            except Exception as ex:
+                span.record_exception(ex)
+                setSpanStatus(span, statusError(str(ex)))
+                raise
+
+    def _startwork(self):
         """Scan all switches and get snmp data"""
         self._start()
         macs = {}

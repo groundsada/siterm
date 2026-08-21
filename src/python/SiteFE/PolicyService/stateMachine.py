@@ -23,6 +23,7 @@ import json
 
 from SiteRMLibs.DefaultParams import DELTA_COMMIT_TIMEOUT, DELTA_REMOVE_TIMEOUT
 from SiteRMLibs.MainUtilities import getLoggingObject, getUTCnow
+from SiteRMLibs.OtelWrapper import getCurrentSpan
 
 
 class StateMachine:
@@ -37,6 +38,13 @@ class StateMachine:
         """Delta State change."""
         tNow = getUTCnow()
         self.logger.info(f"Changing delta {kwargs['uid']} to {newState}")
+        # An event, not a span: this is a point in time inside a longer
+        # operation, and it fires from the choke point every caller goes
+        # through, so the transition lands on whatever span is already running.
+        getCurrentSpan().add_event(
+            "statemachine.transition",
+            {"delta.uid": str(kwargs["uid"]), "delta.state": str(newState)},
+        )
         dbObj.update("deltas", [{"uid": kwargs["uid"], "state": newState, "updatedate": tNow}])
         dbObj.insert(
             "states",

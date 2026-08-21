@@ -40,8 +40,16 @@ from SiteRMLibs.MainUtilities import (
     getVal,
     parseRDFFile,
 )
+from SiteRMLibs.OtelWrapper import (
+    getCurrentSpan,
+    getTracer,
+    setSpanStatus,
+    statusError,
+)
 from SiteRMLibs.timing import Timing
 from SiteRMLibs.Warnings import Warnings
+
+_lookup_tracer = getTracer("siterm.lookupservice")
 
 
 class MultiWorker:
@@ -329,7 +337,27 @@ class LookUpService(SwitchInfo, NodeInfo, DeltaInfo, RDFHelper, BWService, Timin
                 os.unlink(filePath)
 
     def startwork(self):
-        """Main start."""
+        """Main start.
+
+        Only opens the span. The work is in _startwork, kept separate so the
+        span does not cost a reindent of the whole method -- this file is
+        carried as a diff against upstream and that matters.
+        """
+        with _lookup_tracer.start_as_current_span("lookup.build_model") as span:
+            span.set_attribute("lookup.first_run", bool(self.firstRun))
+            try:
+                speedup = self._startwork()
+                # A cycle that changed nothing is the common case; this is what
+                # separates it from one that rebuilt and republished the model.
+                span.set_attribute("lookup.speedup", bool(speedup))
+                return speedup
+            except Exception as ex:
+                span.record_exception(ex)
+                setSpanStatus(span, statusError(str(ex)))
+                raise
+
+    def _startwork(self):
+        """Build the model, apply policy, and provision what changed."""
         # pylint: disable=too-many-statements
         speedup = False
         self.logger.info("Started LookupService work")
@@ -414,6 +442,7 @@ class LookUpService(SwitchInfo, NodeInfo, DeltaInfo, RDFHelper, BWService, Timin
         else:
             updateNeeded = True
             self.logger.info("Models are different. Update DB")
+            getCurrentSpan().set_attribute("lookup.model_updated", True)
             self.modelDiffCounter += 1
             self.saveModel(saveName)
             self.dbI.insert("models", [lastKnownModel])

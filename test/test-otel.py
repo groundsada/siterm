@@ -418,5 +418,57 @@ class ResourceTestCase(unittest.TestCase):
         self.assertNotIn("sitename", res.attributes)
 
 
+class ImportSeamTestCase(unittest.TestCase):
+    """Nothing outside the SDK wiring may import opentelemetry at module scope.
+
+    This is the property the whole optional-dependency design rests on, and it
+    is the one that decays quietly: adding `from opentelemetry import trace` to
+    an instrumented module works perfectly on a developer machine and breaks
+    SiteRM entirely on a site that installed without the otel packages. It has
+    already regressed once. A grep is a blunt test, but it is the only kind
+    that catches the problem at the point it is introduced rather than at the
+    site that cannot start.
+    """
+
+    # The seam itself, plus the SDK wiring it fronts. These are allowed to
+    # import opentelemetry because each guards it with try/ImportError.
+    ALLOWED = {
+        "OtelWrapper.py",
+        "OpenTelemetry.py",
+        "OtelExporters.py",
+        "OtelLogs.py",
+        "OtelMetrics.py",
+    }
+
+    SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "python")
+
+    def _offenders(self):
+        """Files importing opentelemetry at module scope, outside the seam."""
+        found = []
+        for root, _dirs, files in os.walk(self.SOURCE):
+            for name in files:
+                if not name.endswith(".py") or name in self.ALLOWED:
+                    continue
+                path = os.path.join(root, name)
+                with open(path, "r", encoding="utf-8") as fd:
+                    for line in fd:
+                        # Module scope only: an indented import is deferred
+                        # inside a function and is already gated by a caller.
+                        if re.match(r"^(import|from)\s+opentelemetry", line):
+                            found.append(os.path.relpath(path, self.SOURCE))
+                            break
+        return found
+
+    def testNoModuleImportsOpentelemetryDirectly(self):
+        """Instrumented modules go through SiteRMLibs.OtelWrapper, always."""
+        offenders = self._offenders()
+        self.assertEqual(offenders, [], f"import opentelemetry outside the seam: {offenders}")
+
+    def testTheSeamItselfIsStillThere(self):
+        """Guards against the test passing because the tree moved."""
+        wrapper = os.path.join(self.SOURCE, "SiteRMLibs", "OtelWrapper.py")
+        self.assertTrue(os.path.isfile(wrapper), "OtelWrapper.py not found; ALLOWED list is probably stale")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
