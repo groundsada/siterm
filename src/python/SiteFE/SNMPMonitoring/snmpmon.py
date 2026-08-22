@@ -860,9 +860,9 @@ class SNMPMonitoring(Warnings):
                     self.logger.error("[%s]: Too many SNMP errors (%s), skipping further SNMP queries", host, self.lastrunwarnings)
                     break
                 for item in allvals:
-                    indx = item.oid_index
-                    out.setdefault(indx, {})
-                    out[indx][key] = item.value.replace("\x00", "")
+                    index = item.oid_index
+                    out.setdefault(index, {})
+                    out[index][key] = item.value.replace("\x00", "")
             out["macs"] = macs[host]
             self._writeToDB(host, out)
             pollDuration.record(time.time() - pollStart, {"hostname": host})
