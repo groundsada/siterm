@@ -910,9 +910,9 @@ class SNMPMonitoring(Warnings):
                 pushed += 1
             except Exception as ex:  # pylint: disable=broad-except
                 # One unreachable DTN is normal and must not stop the others.
-                self.logger.warning(f"[{self.sitename}]: node_exporter push failed for {hostname}: {ex}")
+                self.logger.warning("[%s]: node_exporter push failed for %s: %s", self.sitename, hostname, ex)
         if pushed:
-            self.logger.info(f"[{self.sitename}]: node_exporter metrics pushed for {pushed} host(s)")
+            self.logger.info("[%s]: node_exporter metrics pushed for %s host(s)", self.sitename, pushed)
 
 
 def execute(config=None, args=None):
