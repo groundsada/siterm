@@ -115,6 +115,11 @@ class Topology:
                     incr += 1
         return wan_links
 
+    # pylint: disable=too-many-locals,too-many-branches
+    # Pre-existing, and left alone deliberately: splitting this up is a real
+    # refactor of untested topology code, and it has nothing to do with the
+    # telemetry work carrying this file. Scoped to this method so the limits
+    # still apply to everything else here.
     def gettopology(self):
         """Return all Switches information"""
 
@@ -401,7 +406,7 @@ class PromOut:
             hostDict["hostinfo"] = self.diragent.getFileContentAsJson(hostDict["hostinfo"])
             hostLastSeen.labels(hostname=host).set(hostDict["updatedate"])
             if int(self.timenow - hostDict["updatedate"]) > SERVICE_DOWN_TIMEOUT:
-                self.logger.warning(f"Host {host} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
+                self.logger.warning("Host %s did not update in the last %s minutes. Skipping.", host, SERVICE_DOWN_TIMEOUT // 60)
                 continue
             if "CertInfo" in hostDict.get("hostinfo", {}).keys():
                 for key in ["notAfter", "notBefore"]:
@@ -469,7 +474,7 @@ class PromOut:
         for item in snmpData:
             snmpLastPoll.labels(hostname=item["hostname"]).set(item["updatedate"])
             if int(self.timenow - item["updatedate"]) > SERVICE_DOWN_TIMEOUT:
-                self.logger.warning(f"SNMP {item['hostname']} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
+                self.logger.warning("SNMP %s did not update in the last %s minutes. Skipping.", item["hostname"], SERVICE_DOWN_TIMEOUT // 60)
                 continue
             out = evaldict(item.get("output", {}))
             # Skip hostnamemem- and hostnamedisk- devices. This is covered in __memStats/__diskStats
@@ -681,13 +686,13 @@ class SNMPMonitoring(Warnings):
         self.hostconf[host] = self.switch.plugin.getHostConfig(host)
         if self.config.config["MAIN"].get(host, {}).get("external_snmp", ""):
             snmphost = self.config.config["MAIN"][host]["external_snmp"]
-            self.logger.info(f"SNMP Scan skipped for {host}. Remote endpoint defined: {snmphost}")
+            self.logger.info("SNMP Scan skipped for %s. Remote endpoint defined: %s", host, snmphost)
             return
         if "snmp_monitoring" not in self.hostconf[host]:
-            self.logger.info(f"Ansible host: {host} config does not have snmp_monitoring parameters")
+            self.logger.info("Ansible host: %s config does not have snmp_monitoring parameters", host)
             return
         if "session_vars" not in self.hostconf[host]["snmp_monitoring"]:
-            self.logger.info(f"Ansible host: {host} config does not have session_vars parameters")
+            self.logger.info("Ansible host: %s config does not have session_vars parameters", host)
             return
         # easysnmp does not support ipv6 and will fail with ValueError (unable to unpack)
         # To avoid this, we will bypass ipv6 check if error is raised.
@@ -724,7 +729,7 @@ class SNMPMonitoring(Warnings):
         # FRR - runs on top of linux, so we will get mac addresses via ansible
         updatedate = self.switch.switches.get("output", {}).get(host, {}).get("dbinfo", {}).get("updatedate", 0)
         if (getUTCnow() - updatedate) > 1200:
-            self.logger.info(f"[{host}]: Forcing ansible to update device information")
+            self.logger.info("[%s]: Forcing ansible to update device information", host)
             self.switch.deviceUpdate(self.sitename, host)
         self.switch.getinfo()
         mactable = self.switch.output.get("mactable", {}).get(host, {})
@@ -852,7 +857,7 @@ class SNMPMonitoring(Warnings):
             for key in self.config["MAIN"]["snmp"]["mibs"]:
                 allvals = self._getSNMPVals(key, host)
                 if len(self.lastrunwarnings) > 3:
-                    self.logger.error(f"[{host}]: Too many SNMP errors ({self.lastrunwarnings}), skipping further SNMP queries")
+                    self.logger.error("[%s]: Too many SNMP errors (%s), skipping further SNMP queries", host, self.lastrunwarnings)
                     break
                 for item in allvals:
                     indx = item.oid_index
@@ -861,17 +866,17 @@ class SNMPMonitoring(Warnings):
             out["macs"] = macs[host]
             self._writeToDB(host, out)
             pollDuration.record(time.time() - pollStart, {"hostname": host})
-        self.logger.info(f"[{self.sitename}]: SNMP Monitoring finished for {len(self.switches)} switches")
+        self.logger.info("[%s]: SNMP Monitoring finished for %s switches", self.sitename, len(self.switches))
         # Get Memory and Disk Statistics
         self.getMemStats()
-        self.logger.info(f"[{self.sitename}]: Memory statistics written to DB")
+        self.logger.info("[%s]: Memory statistics written to DB", self.sitename)
         self.getDiskStats()
-        self.logger.info(f"[{self.sitename}]: Disk statistics written to DB")
+        self.logger.info("[%s]: Disk statistics written to DB", self.sitename)
         # Set Prometheus output
         self.prom.metrics()
         # Set Topology json
         self.topo.gettopology()
-        self.logger.info(f"[{self.sitename}]: Topology map written to DB")
+        self.logger.info("[%s]: Topology map written to DB", self.sitename)
         self.pushNodeExporter()
 
     def pushNodeExporter(self):
