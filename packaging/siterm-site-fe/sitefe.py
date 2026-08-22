@@ -16,6 +16,7 @@ from SiteFE.REST.Frontend import router as fe_router
 from SiteFE.REST.Host import router as host_router
 from SiteFE.REST.Model import router as model_router
 from SiteFE.REST.Monitoring import router as monitoring_router
+from SiteFE.REST.Otlp import router as otlp_router
 from SiteFE.REST.Service import router as service_router
 from SiteFE.REST.Topo import router as topo_router
 from SiteRMLibs.MainUtilities import envBool, loadEnvFile
@@ -66,6 +67,7 @@ app.include_router(debug_router, prefix="/api")
 app.include_router(topo_router, prefix="/api")
 app.include_router(monitoring_router, prefix="/api")
 app.include_router(service_router, prefix="/api")
+app.include_router(otlp_router, prefix="/api")
 
 app.mount("/", StaticFiles(directory=os.getenv("SITERM_STATIC_DIR", "/var/www/html"), html=True), name="ui")
 
