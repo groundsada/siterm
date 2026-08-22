@@ -24,12 +24,15 @@ import os
 import sys
 import time
 
+import requests
+
 from easysnmp import Session
 from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDError
 from prometheus_client import CollectorRegistry, generate_latest
 from SiteRMLibs.MetricsBridge import DualEnum, DualGauge, DualInfo
 from SiteRMLibs.OtelHealth import renderInto as renderOtelHealth
-from SiteRMLibs.OtelMetrics import getHistogram, initMetrics
+from SiteRMLibs.OtelMetrics import getGauge, getHistogram, initMetrics
+from SiteRMLibs.NodeExporterPush import nodeExporterUrl, parseSamples
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
 from SiteRMLibs.DeltaMetrics import DeltaMetrics
@@ -52,6 +55,11 @@ from SiteRMLibs.OtelWrapper import getTracer, setSpanStatus, statusError
 from SiteRMLibs.Warnings import Warnings
 
 _snmp_tracer = getTracer("siterm.snmpmonitoring")
+
+# A DTN's node_exporter answers in milliseconds on a healthy host. This is short
+# on purpose: the poll runs at the end of the monitoring cycle and a hung DTN
+# must not hold the next one up.
+NODE_EXPORTER_TIMEOUT = 10
 
 
 class Topology:
@@ -864,6 +872,47 @@ class SNMPMonitoring(Warnings):
         # Set Topology json
         self.topo.gettopology()
         self.logger.info(f"[{self.sitename}]: Topology map written to DB")
+        self.pushNodeExporter()
+
+    def pushNodeExporter(self):
+        """Poll each DTN's node_exporter and push what it returns.
+
+        Lives here because this is the frontend's periodic monitoring collector
+        -- it already gathers memory and disk statistics, which are no more
+        about switches than these are -- and it already holds a DB handle and
+        runs on a cycle. A separate daemon would need its own launcher script
+        and a supervisord entry in siterm-startup for a job measured in
+        milliseconds.
+
+        Gated per host on `node_exporter_passthrough`, the flag SENSE's own docs
+        already tell sites to set. That keeps the scope to hosts that have
+        deliberately opted into the frontend reaching them, and it means turning
+        this on does not silently start polling a DTN nobody expected.
+
+        Never raises. This runs at the end of a cycle that has already written
+        everything else it needed to, and a DTN that is down must not cost the
+        switch poll its run.
+        """
+        pushed = 0
+        for hostname, hostdata in getAllHosts(self.dbI).items():
+            try:
+                hostinfo = self.diragent.getFileContentAsJson(hostdata.get("hostinfo", ""))
+                general = hostinfo.get("Summary", {}).get("config", {}).get("general", {})
+                if not general.get("node_exporter_passthrough", False):
+                    continue
+                url = nodeExporterUrl(general.get("node_exporter", ""))
+                if not url:
+                    continue
+                response = requests.get(url, timeout=NODE_EXPORTER_TIMEOUT)
+                response.raise_for_status()
+                for name, attributes, value in parseSamples(response.text, hostname):
+                    getGauge(name, "Relayed from this host's node_exporter").set(value, attributes)
+                pushed += 1
+            except Exception as ex:  # pylint: disable=broad-except
+                # One unreachable DTN is normal and must not stop the others.
+                self.logger.warning(f"[{self.sitename}]: node_exporter push failed for {hostname}: {ex}")
+        if pushed:
+            self.logger.info(f"[{self.sitename}]: node_exporter metrics pushed for {pushed} host(s)")
 
 
 def execute(config=None, args=None):
