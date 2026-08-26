@@ -23,6 +23,8 @@ import re
 import sys
 import unittest
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "python"))
+
 
 class _Blocker:
     """Import hook that makes chosen top-level packages unimportable."""
