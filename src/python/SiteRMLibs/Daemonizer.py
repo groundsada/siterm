@@ -18,7 +18,6 @@ import tracemalloc
 
 import psutil
 from deepdiff import DeepDiff
-from opentelemetry.instrumentation.logging import LoggingInstrumentor
 from SiteRMLibs import __version__ as runningVersion
 from SiteRMLibs.CustomExceptions import (
     HTTPServerNotReady,
@@ -45,6 +44,38 @@ from SiteRMLibs.MainUtilities import (
     timeout,
 )
 from SiteRMLibs.OpenTelemetry import init_otel
+from SiteRMLibs.OtelMetrics import getCounter, getGauge, getHistogram, initMetrics
+from SiteRMLibs.OtelWrapper import (
+    getTracer,
+    instrumentLogging,
+    setSpanStatus,
+    statusError,
+    statusOk,
+)
+
+# The daemon-services root tracer. Each poll cycle of every SiteRM service
+# (DBWorker, PolicyService, SNMPMonitoring, ...) runs through Daemonizer.run(),
+# so a span here becomes the root that MainUtilities.TraceFormatter stamps onto
+# every log line emitted underneath it.
+_daemon_tracer = getTracer("siterm.daemonizer")
+
+
+def _cycleMetrics():
+    """Fleet-health instruments, shared by every daemon.
+
+    Built lazily on first use rather than at import: initMetrics() has to have
+    run first, and it runs in Daemon.__init__.
+
+    These reach the collector over OTLP only. The Prometheus pull path serves
+    the snmpinfo.txt that SNMPMonitoring writes, and that is a different
+    process from the daemon being measured, so there is no registry here for
+    them to be rendered into.
+    """
+    return (
+        getHistogram("siterm_daemon_cycle_duration_seconds", "Wall time of one daemon poll cycle"),
+        getGauge("siterm_daemon_last_success_timestamp_seconds", "When this daemon last completed a cycle without error"),
+        getCounter("siterm_daemon_cycle_errors_total", "Daemon poll cycles that ended in an error"),
+    )
 
 
 def getParser(description):
@@ -280,7 +311,10 @@ class Daemon(DBBackend):
         """Initialize the daemon."""
         loadEnvFile()
         init_otel(component)
-        LoggingInstrumentor().instrument(set_logging_format=True)
+        # Every daemon, not just snmpmon: this is what gives the cycle
+        # instruments below somewhere to record. Idempotent.
+        initMetrics(component)
+        instrumentLogging()
         logType = "TimedRotatingFileHandler"
         if inargs.logtostdout:
             logType = "StreamLogger"
@@ -665,30 +699,57 @@ class Daemon(DBBackend):
                     stwork = int(getUTCnow())
                     refresh = self.autoRefreshDB(**{"sitename": sitename})
                     self.logger.debug("Start worker for %s site", sitename)
-                    try:
-                        self.preRunThread(sitename, rthread)
-                        with timeout(180):
-                            speedup = self.__run(rthread)
-                        self.reporter("OK", sitename, stwork)
-                    except ServiceWarning as ex:
-                        exc = traceback.format_exc()
-                        self.reporter("WARNING", sitename, stwork, str(ex))
-                        self.logger.warning("Service Warning!!! Error details:  %s", ex)
-                        self.logger.warning("Service Warning!!! Traceback details:  %s", exc)
-                        self.logger.warning("It is not fatal error. Continue to run normally.")
-                    except HTTPServerNotReady as ex:
-                        exc = traceback.format_exc()
-                        self.logger.error("HTTP Server Not Ready!!! Error details:  %s", ex)
-                        self.logger.error("HTTP Server Not Ready!!! Traceback details:  %s", exc)
-                        self.logger.error("Look at SiteRM Frontend logs for more details.")
-                    except Exception as ex:
-                        hadFailure = True
-                        self.reporter("FAILED", sitename, stwork, str(ex))
-                        exc = traceback.format_exc()
-                        self.logger.critical(f"Exception!!! Error details:  {ex}. Traceback details: {exc}")
-                    finally:
-                        self.postRunThread(sitename, rthread)
-                        self.logger.debug("Finished worker for %s site", sitename)
+                    # Root span for this site's poll cycle. This is the span the
+                    # LoggingInstrumentor records trace_id from, so each poll is
+                    # one trace with the worker's spans nested under it.
+                    cycleStart = time.time()
+                    outcome = "ok"
+                    with _daemon_tracer.start_as_current_span(
+                        f"{self.component}.{sitename}.poll",
+                        attributes={
+                            # No service.name here: init_otel() already sets it as
+                            # a Resource attribute, and repeating it at span level
+                            # overrides a resource-level semantic-convention key.
+                            "sitename": sitename,
+                            "siterm.component": self.component,
+                            "run.count": self.runCount + 1,
+                        },
+                    ) as poll_span:
+                        try:
+                            self.preRunThread(sitename, rthread)
+                            with timeout(180):
+                                speedup = self.__run(rthread)
+                            self.reporter("OK", sitename, stwork)
+                            setSpanStatus(poll_span, statusOk())
+                        except ServiceWarning as ex:
+                            exc = traceback.format_exc()
+                            self.reporter("WARNING", sitename, stwork, str(ex))
+                            self.logger.warning("Service Warning!!! Error details:  %s", ex)
+                            self.logger.warning("Service Warning!!! Traceback details:  %s", exc)
+                            self.logger.warning("It is not fatal error. Continue to run normally.")
+                            poll_span.set_attribute("poll.status", "warning")
+                            poll_span.record_exception(ex)
+                            outcome = "warning"
+                        except HTTPServerNotReady as ex:
+                            exc = traceback.format_exc()
+                            self.logger.error("HTTP Server Not Ready!!! Error details:  %s", ex)
+                            self.logger.error("HTTP Server Not Ready!!! Traceback details:  %s", exc)
+                            self.logger.error("Look at SiteRM Frontend logs for more details.")
+                            poll_span.set_attribute("poll.status", "notready")
+                            poll_span.record_exception(ex)
+                            outcome = "notready"
+                        except Exception as ex:
+                            hadFailure = True
+                            self.reporter("FAILED", sitename, stwork, str(ex))
+                            exc = traceback.format_exc()
+                            self.logger.critical(f"Exception!!! Error details:  {ex}. Traceback details: {exc}")
+                            setSpanStatus(poll_span, statusError(str(ex)))
+                            poll_span.record_exception(ex)
+                            outcome = "failed"
+                        finally:
+                            self.postRunThread(sitename, rthread)
+                            self._recordCycle(sitename, cycleStart, outcome)
+                            self.logger.debug("Finished worker for %s site", sitename)
                 if self.runLoop():
                     time.sleep(self.sleepTimers["ok"] // 2 if speedup else self.sleepTimers["ok"])
             except KeyboardInterrupt as ex:
@@ -709,6 +770,16 @@ class Daemon(DBBackend):
                 self._refreshConfig()
                 self.refreshThreads()
             self.logger.debug("Daemonizer main loop end. Run count: %s", self.runCount)
+
+    def _recordCycle(self, sitename, started, outcome):
+        """Record one poll cycle on the fleet-health instruments."""
+        duration, lastSuccess, errors = _cycleMetrics()
+        attrs = {"component": self.component, "sitename": sitename}
+        duration.record(time.time() - started, attrs)
+        if outcome == "ok":
+            lastSuccess.set(getUTCnow(), attrs)
+        else:
+            errors.add(1, dict(attrs, outcome=outcome))
 
     @staticmethod
     def getThreads():

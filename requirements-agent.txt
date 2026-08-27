@@ -23,8 +23,18 @@ cryptography
 gitpython
 sqlalchemy>=2.0,<3.0
 alembic
+# Optional at runtime -- SiteRMLibs.OtelWrapper degrades to no-op tracers when
+# these are absent -- but shipped in the image so agents can emit spans. The
+# >=1.39.1 floor is a correctness requirement, not currency; see the note in
+# requirements-sitefe.txt for the fork-safety reason.
 opentelemetry-api>=1.39.1,<1.40.0
 opentelemetry-sdk>=1.39.1,<1.40.0
 opentelemetry-instrumentation-fastapi>=0.60b1,<0.61b0
+opentelemetry-instrumentation-httpx>=0.60b1,<0.61b0
 opentelemetry-instrumentation-logging>=0.60b1,<0.61b0
+opentelemetry-instrumentation-sqlalchemy>=0.60b1,<0.61b0
 opentelemetry-exporter-otlp>=1.39.1,<1.40.0
+# Same b-numbered train as the instrumentation packages, not the 1.x train.
+# Installing this unpinned resolves a newer opentelemetry-sdk and silently
+# breaks the floor pinned above.
+opentelemetry-exporter-prometheus>=0.60b1,<0.61b0

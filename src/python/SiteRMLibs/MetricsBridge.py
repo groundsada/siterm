@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""Writes one value to both metric paths at once.
+
+29 scrape jobs, 67 alert rules and every existing panel read `snmpinfo.txt`, so
+its output must not change while the push path is being proven. Each class here
+keeps the `prometheus_client` object byte-identical and additionally records the
+same value into an OTel instrument, set from the same variable on the same line.
+
+A migration scaffold: once parity is confirmed the prometheus_client half comes
+out. Call sites keep the shape they already have:
+
+    memInfo = DualGauge("memory_usage", "Memory Usage for Service",
+                        ["servicename", "key", "hostname"], registry)
+    memInfo.labels(servicename=..., key=..., hostname=...).set(val)
+"""
+
+from prometheus_client import Enum, Gauge, Info
+
+from SiteRMLibs.OtelMetrics import getGauge
+
+
+def _attrs(labels, extra=None):
+    """Label dict as OTel attributes, with every value a string.
+
+    prometheus_client stringifies label values on the way out, so an int label
+    -- PromPush passes the mac index as one -- would otherwise reach Mimir as an
+    OTLP int attribute and the two paths would disagree on the type even where
+    they agree on the text.
+    """
+    out = {key: str(val) for key, val in labels.items()}
+    if extra:
+        out.update({key: str(val) for key, val in extra.items()})
+    return out
+
+
+class _BoundGauge:
+    """One label set of a DualGauge."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, prom, otel, labels):
+        self._prom = prom
+        self._otel = otel
+        self._labels = labels
+
+    def set(self, value):
+        """Set both paths."""
+        self._prom.set(value)
+        self._otel.set(value, _attrs(self._labels))
+
+
+class DualGauge:
+    """A prometheus_client Gauge that also feeds an OTel gauge."""
+
+    def __init__(self, name, documentation, labelnames=(), registry=None):
+        self._prom = Gauge(name, documentation, labelnames, registry=registry)
+        self._otel = getGauge(name, documentation)
+        self._labelnames = tuple(labelnames)
+
+    def labels(self, **labels):
+        """Bind a label set."""
+        return _BoundGauge(self._prom.labels(**labels), self._otel, labels)
+
+    def set(self, value):
+        """Set an unlabelled gauge on both paths.
+
+        prometheus_client refuses labels() on a gauge with no label names, so a
+        process-wide signal has to be set directly rather than through a bind.
+        """
+        if self._labelnames:
+            raise ValueError("gauge has labels; call labels() first")
+        self._prom.set(value)
+        self._otel.set(value, {})
+
+
+class _BoundInfo:
+    """One label set of a DualInfo."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, prom, otel, labels):
+        self._prom = prom
+        self._otel = otel
+        self._labels = labels
+
+    def info(self, payload):
+        """Set both paths.
+
+        OTel has no Info type, so the prometheus shape is rebuilt by hand: a
+        gauge fixed at 1 with the payload merged into the labels.
+        """
+        self._prom.info(payload)
+        self._otel.set(1, _attrs(self._labels, payload))
+
+
+class DualInfo:
+    """A prometheus_client Info that also feeds an OTel gauge."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, name, documentation, labelnames=(), registry=None):
+        self._prom = Info(name, documentation, labelnames=labelnames, registry=registry)
+        self._otel = getGauge(f"{name}_info", documentation)
+
+    def labels(self, **labels):
+        """Bind a label set."""
+        return _BoundInfo(self._prom.labels(**labels), self._otel, labels)
+
+
+class _BoundEnum:
+    """One label set of a DualEnum."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, prom, otel, labels, name, states):
+        self._prom = prom
+        self._otel = otel
+        self._labels = labels
+        self._name = name
+        self._states = states
+
+    def state(self, value):
+        """Set both paths.
+
+        One series per state with a label named after the metric, 1.0 on the
+        active one. Panels select on that label, e.g. service_state{service_state="OK"}.
+        """
+        self._prom.state(value)
+        for state in self._states:
+            self._otel.set(1 if state == value else 0, _attrs(self._labels, {self._name: state}))
+
+
+class DualEnum:
+    """A prometheus_client Enum that also feeds an OTel gauge."""
+
+    # pylint: disable=too-few-public-methods
+
+    def __init__(self, name, documentation, labelnames=(), states=None, registry=None):
+        self._prom = Enum(name, documentation, labelnames, states=states, registry=registry)
+        self._otel = getGauge(name, documentation)
+        self._name = name
+        self._states = list(states)
+
+    def labels(self, **labels):
+        """Bind a label set."""
+        return _BoundEnum(self._prom.labels(**labels), self._otel, labels, self._name, self._states)

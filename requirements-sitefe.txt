@@ -29,8 +29,21 @@ gitpython
 argon2-cffi
 sqlalchemy>=2.0,<3.0
 alembic
+# opentelemetry-sdk >=1.39.1 is a correctness floor, not just currency.
+# SiteRM builds the TracerProvider and BatchSpanProcessor before forking: the
+# daemons double-fork in Daemonizer.daemonize(), and the frontend runs gunicorn
+# with --preload. The exporter's background thread does not survive fork(). The
+# SDK's shared BatchProcessor calls os.register_at_fork(after_in_child=...) to
+# rebuild it in the child; without that, children queue spans forever and export
+# nothing, silently. Re-verify before relaxing this pin.
 opentelemetry-api>=1.39.1,<1.40.0
 opentelemetry-sdk>=1.39.1,<1.40.0
 opentelemetry-instrumentation-fastapi>=0.60b1,<0.61b0
+opentelemetry-instrumentation-httpx>=0.60b1,<0.61b0
 opentelemetry-instrumentation-logging>=0.60b1,<0.61b0
+opentelemetry-instrumentation-sqlalchemy>=0.60b1,<0.61b0
 opentelemetry-exporter-otlp>=1.39.1,<1.40.0
+# Same b-numbered train as the instrumentation packages, not the 1.x train.
+# Installing this unpinned resolves a newer opentelemetry-sdk and silently
+# breaks the floor pinned above.
+opentelemetry-exporter-prometheus>=0.60b1,<0.61b0
