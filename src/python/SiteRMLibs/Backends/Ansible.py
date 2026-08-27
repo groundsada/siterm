@@ -21,7 +21,11 @@ import ansible_runner
 import yaml
 from SiteRMLibs.Backends import parsers
 from SiteRMLibs.CustomExceptions import ConfigException
-from SiteRMLibs.MainUtilities import getLoggingObject, withTimeout
+from SiteRMLibs.MainUtilities import getLoggingObject, getUTCnow, withTimeout
+from SiteRMLibs.OtelMetrics import getCounter, getGauge, getHistogram
+from SiteRMLibs.OtelWrapper import getTracer, traceparent
+
+_ansible_tracer = getTracer("siterm.ansible")
 
 
 class Switch:
@@ -41,9 +45,29 @@ class Switch:
         """Activating state actions."""
         return True
 
+    @staticmethod
+    def _recordReachability(ansOut):
+        """Report which switches answered at all.
+
+        `dark` is ansible's unreachable bucket, and it is a different thing from
+        `failures`: a switch that cannot be reached runs no tasks and reports no
+        errors, so switch_errors stays silent and it is indistinguishable from a
+        quiet, healthy switch. Reachable hosts are set to 0 rather than left
+        absent, so the series exists to be alerted on.
+        """
+        if not ansOut or not ansOut.stats:
+            return
+        unreachable = getGauge("siterm_switch_unreachable", "1 when ansible could not reach this switch")
+        for key in ["ok", "failures"]:
+            for host in ansOut.stats.get(key, {}):
+                unreachable.set(0, {"hostname": host})
+        for host in ansOut.stats.get("dark", {}):
+            unreachable.set(1, {"hostname": host})
+
     def getAnsErrors(self, ansOut):
         """Get Ansible errors"""
         failures = False
+        self._recordReachability(ansOut)
         if not ansOut or not ansOut.stats:
             return failures
         for fkey in ["dark", "failures"]:
@@ -122,37 +146,63 @@ class Switch:
         # As we might be running multiple workers, we need to make sure
         # cleanup process is done correctly.
         retryCount = self.config.getint("ansible", "ansible_runtime_retry")
-        while retryCount > 0:
-            try:
-                ansOut = ansible_runner.run(
-                    private_data_dir=self.config.get("ansible", "private_data_dir" + subitem),
-                    inventory=self.config.get("ansible", "inventory" + subitem),
-                    playbook=playbook,
-                    rotate_artifacts=self._getRotateArtifacts(playbook, subitem),
-                    debug=self.config.getboolean("ansible", "debug" + subitem),
-                    verbosity=self.__getVerbosity(subitem),
-                    ignore_logging=self.config.getboolean("ansible", "ignore_logging" + subitem),
-                    envvars={
-                        "ANSIBLE_RUNNER_IDLE_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_idle_timeout")),
-                        "ANSIBLE_RUNNER_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_job_timeout")),
-                    },
-                )
-                self.__logAnsibleOutput(ansOut)
-                return ansOut
-            except FileNotFoundError as ex:
-                self.logger.error(f"Ansible playbook got FileNotFound (usually cleanup. Will retry in 5sec): {ex}")
-                self.logger.debug(f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}")
-                retryCount -= 1
-                time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
-            except Exception as ex:
-                self.logger.error(f"Ansible playbook got unexpected Exception: {ex}")
-                self.logger.debug(
-                    f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}",
-                    exc_info=True,
-                )
-                self.logger.debug(f"Full traceback: {traceback.format_exc()}")
-                retryCount -= 1
-                time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+        ansDuration = getHistogram("siterm_ansible_duration_seconds", "Wall time of one ansible playbook run")
+        ansRetries = getCounter("siterm_ansible_retries_total", "Ansible playbook attempts that had to be retried")
+        started = time.time()
+        # ansible_runner runs a subprocess, which severs the OTel context chain
+        # (this is the "ansible boundary" of #6). Wrap the run in a child span
+        # so each ansible invocation still nests under the daemon poll span, and
+        # hand the parent trace context to the subprocess via env so its own
+        # stdout instrumentation can correlate if present.
+        with _ansible_tracer.start_as_current_span(
+            f"ansible.{playbook}",
+            attributes={
+                "ansible.playbook": playbook,
+                "ansible.hosts": hosts or "",
+                "ansible.subitem": subitem,
+            },
+        ) as ans_span:
+            while retryCount > 0:
+                try:
+                    ansOut = ansible_runner.run(
+                        private_data_dir=self.config.get("ansible", "private_data_dir" + subitem),
+                        inventory=self.config.get("ansible", "inventory" + subitem),
+                        playbook=playbook,
+                        rotate_artifacts=self._getRotateArtifacts(playbook, subitem),
+                        debug=self.config.getboolean("ansible", "debug" + subitem),
+                        verbosity=self.__getVerbosity(subitem),
+                        ignore_logging=self.config.getboolean("ansible", "ignore_logging" + subitem),
+                        envvars={
+                            "ANSIBLE_RUNNER_IDLE_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_idle_timeout")),
+                            "ANSIBLE_RUNNER_TIMEOUT": str(self.config.getint("ansible", "ansible_runtime_job_timeout")),
+                            # Best-effort: let ansible's own processes see the
+                            # parent trace so remote logs could correlate.
+                            "TRACEPARENT": traceparent(),
+                        },
+                    )
+                    self.__logAnsibleOutput(ansOut)
+                    ans_span.set_attribute("ansible.rc", getattr(ansOut, "rc", -1))
+                    ansDuration.record(time.time() - started, {"playbook": playbook, "outcome": "ok"})
+                    return ansOut
+                except FileNotFoundError as ex:
+                    self.logger.error(f"Ansible playbook got FileNotFound (usually cleanup. Will retry in 5sec): {ex}")
+                    self.logger.debug(f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}")
+                    retryCount -= 1
+                    ansRetries.add(1, {"playbook": playbook})
+                    time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+                except Exception as ex:
+                    self.logger.error(f"Ansible playbook got unexpected Exception: {ex}")
+                    self.logger.debug(
+                        f"Exception happened for {playbook} on hosts {hosts} with subitem {subitem}",
+                        exc_info=True,
+                    )
+                    self.logger.debug(f"Full traceback: {traceback.format_exc()}")
+                    ans_span.record_exception(ex)
+                    retryCount -= 1
+                    ansRetries.add(1, {"playbook": playbook})
+                    time.sleep(self.config.getint("ansible", "ansible_runtime_retry_delay"))
+        # The retry loop is exhausted, which until now left no trace at all.
+        ansDuration.record(time.time() - started, {"playbook": playbook, "outcome": "failed"})
         raise Exception("Ansible playbook execution failed after 3 retries. Check logs for more details.")
 
     def getAnsNetworkOS(self, host, subitem=""):
@@ -193,8 +243,23 @@ class Switch:
                 time.sleep(5)
                 self.verbosity = 7
                 continue
+            self._recordConfigApplied(ansOut)
             retries = 0
         return ansOut, self.ansibleErrs
+
+    @staticmethod
+    def _recordConfigApplied(ansOut):
+        """Stamp when config last actually landed, per switch.
+
+        Nothing else distinguishes "applied 30s ago" from "last applied before
+        the outage" -- the config itself looks the same either way.
+        """
+        if not ansOut or not ansOut.stats:
+            return
+        applied = getGauge("siterm_switch_config_applied_timestamp_seconds", "When configuration last applied cleanly to this switch")
+        now = getUTCnow()
+        for host in ansOut.stats.get("ok", {}):
+            applied.set(now, {"hostname": host})
 
     def _getFacts(self, hosts=None, subitem=""):
         """Get All Facts for all Ansible Hosts"""

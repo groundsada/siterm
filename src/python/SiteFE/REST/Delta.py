@@ -56,8 +56,12 @@ from SiteRMLibs.MainUtilities import (
     removeFile,
     saveContent,
 )
+from SiteRMLibs.OtelWrapper import getCurrentSpan, getTracer, traceparent
 
 router = APIRouter()
+
+TRACER = getTracer("siterm.delta")
+
 
 startupConfig = getstartupconfig()
 
@@ -344,10 +348,21 @@ async def submitDelta(
             "accepting",
         ]:
             deps["dbI"].delete("deltas", [["uid", delta["uid"]]])
+    reqspan = getCurrentSpan()
+    reqspan.set_attributes(
+        {
+            "delta.id": item.id,
+            "delta.sitename": sitename,
+            "delta.has_addition": bool(item.addition),
+            "delta.has_reduction": bool(item.reduction),
+        }
+    )
+
     try:
         # Get latest model, and check if modelId is same as latest
         # If not, raise an Error, as model was updated, and things have changed.
-        latestModel = depGetModel(deps["dbI"], limit=1, orderby=["insertdate", "DESC"])[0]
+        with TRACER.start_as_current_span("delta.resolve_model"):
+            latestModel = depGetModel(deps["dbI"], limit=1, orderby=["insertdate", "DESC"])[0]
         item.modelId = latestModel["uid"] if not item.modelId else item.modelId  # Set it to the latest, if not provided.
         if latestModel["uid"] != item.modelId:
             # Model ID does not match latest model, and latest model is the one with all committed changes. We will bypass the request and use the latest model ID.
@@ -364,6 +379,11 @@ async def submitDelta(
         "content": item.dict(),
         "State": "accepting",
         "modelId": item.modelId,
+        # Persist the W3C traceparent of the submitting request so the async
+        # consumer (PolicyService daemon, a SEPARATE process and poll span) can
+        # link its work back to this trace (#4). Without this the delta work
+        # shows up as an orphan under PolicyService's own poll root.
+        "traceparent": traceparent(),
     }
     # Save item to disk
     fname = os.path.join(
@@ -378,21 +398,32 @@ async def submitDelta(
         "httpfinished",
         f"{item.id}.json",
     )
-    saveContent(fname, outContent)
-    _record_delta_action(deps["dbI"], deps["user"]["user_info"]["sub"], item.id, "submit", _extract_sense_headers(request))
+    with TRACER.start_as_current_span("delta.persist") as pspan:
+        pspan.set_attributes({"delta.model_id": str(item.modelId), "delta.traceparent": outContent["traceparent"]})
+        # Identity comes from the AUTHENTICATED principal (JWT subject), never
+        # from the unauthenticated sense-request-* headers (#2).
+        if deps.get("user", {}).get("user_info", {}).get("sub"):
+            pspan.set_attribute("user.sub", deps["user"]["user_info"]["sub"])
+        saveContent(fname, outContent)
+        _record_delta_action(deps["dbI"], deps["user"]["user_info"]["sub"], item.id, "submit", _extract_sense_headers(request))
 
     # This is a blocking call, better approach is to reply and ask to check later.
     # But for now, we will block until we get output from PolicyService.
     # Loop for max 50seconds and check if we have file in finished directory.
     out = {}
     timer = 50
-    while timer > 0:
-        if os.path.isfile(finishedName):
-            out = getFileContentAsJson(finishedName)
-            removeFile(finishedName)
-            break
-        timer -= 1
-        sleep(1)
+    # PolicyService picks the delta up from httpnew/ and writes its result to
+    # httpfinished/. Nearly all submit latency lives in this poll, and it is
+    # the handoff between the two services, so it gets its own span.
+    with TRACER.start_as_current_span("delta.await_policyservice", attributes={"delta.timeout_s": timer}) as wspan:
+        while timer > 0:
+            if os.path.isfile(finishedName):
+                out = getFileContentAsJson(finishedName)
+                removeFile(finishedName)
+                break
+            timer -= 1
+            sleep(1)
+        wspan.set_attributes({"delta.wait_s": 50 - timer, "delta.timed_out": bool(timer == 0 and not out)})
     # If timer reached 0, we will not have file in finished directory
     if timer == 0 and not out:
         # Return failed http code
@@ -406,6 +437,7 @@ async def submitDelta(
             detail="Failed to accept delta. Output is empty.",
         )
     outContent["State"] = out["State"]
+    reqspan.set_attribute("delta.state", str(out["State"]))
     outContent["id"] = item.id
     outContent["lastModified"] = convertTSToDatetime(outContent["updatedate"])
     outContent["href"] = f"{request.base_url}api/{sitename}/deltas/{item.id}"

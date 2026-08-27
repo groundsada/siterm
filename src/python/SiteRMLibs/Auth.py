@@ -117,11 +117,17 @@ def load_cert_info(cert):
     out["subject"] = name_to_openssl(cert.subject)
     out["notBefore"] = int(cert.not_valid_before_utc.timestamp())
     out["notAfter"] = int(cert.not_valid_after_utc.timestamp())
-    out["fullDN"] = f"{out['issuer']}{out['subject']}"
+    # fullDN is issuer + subject so a CA-issued leaf yields the chain DN. For a
+    # self-signed cert (issuer == subject) concatenating them doubles the DN and
+    # never matches the single full_dn configured for the m2m credential. When
+    # they are equal just use the subject. #14.
+    out["fullDN"] = out["subject"] if out["issuer"] == out["subject"] else f"{out['issuer']}{out['subject']}"
     return out
 
 
 _CHALLENGE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+CHALLENGE_TTL = 60
 
 
 def get_challenge_record(challenge_id: str):
@@ -132,6 +138,31 @@ def get_challenge_record(challenge_id: str):
     if not os.path.exists(tempfile):
         return None
     return getFileContentAsJson(tempfile)
+
+
+def sweep_challenges():
+    """Delete challenges past their TTL.
+
+    Nothing else removes them: verify_challenge deletes only the one it
+    consumed, so every challenge that is issued and never completed stays on
+    disk for the life of the container.
+    """
+    challengedir = f"{getTempDir()}/m2m"
+    if not os.path.isdir(challengedir):
+        return
+    cutoff = getUTCnow() - CHALLENGE_TTL
+    for fname in os.listdir(challengedir):
+        if not fname.endswith(".json"):
+            continue
+        fullpath = os.path.join(challengedir, fname)
+        try:
+            # mtime, not the record's expires_at: the file is written once at
+            # issue time, so this needs no read and cannot trip over a record
+            # left truncated by a crash mid-write.
+            if os.path.getmtime(fullpath) < cutoff:
+                os.unlink(fullpath)
+        except OSError:
+            continue
 
 
 def base64url_encode_nopad(b: bytes) -> str:
@@ -200,6 +231,54 @@ def client_ip_allowed(client_ip, allowed_ips):
     return False
 
 
+DEFAULT_PORTS = {"https": "443", "http": "80"}
+
+
+def normalizeIssuer(issuer, derived=False):
+    """The issuer URL with the parts a relying party cannot be asked to guess.
+
+    A relying party compares this string to the token's `iss` claim byte for
+    byte, so it has to be stable and it has to be a URL. Deriving it from
+    `general.webdomain` -- a value written to be read by humans -- makes it
+    neither, which is why the problems below are worth catching here rather
+    than in whatever is federating these frontends.
+
+    A trailing slash is removed. It is not cosmetic: `getOpenIDConfiguration`
+    builds `jwks_uri` and the token endpoints by concatenation, so one turns
+    them into `https://host//.well-known/jwks.json`, and it changes `iss`.
+
+    A scheme-default port is reported but NOT removed. `https://host:443` and
+    `https://host` denote the same authority, so stripping it would be correct
+    in the abstract. It is still the wrong thing to do silently: every relying
+    party already holds whichever string this frontend published before, a
+    fleet upgrades one site at a time, and nothing can hold both forms for one
+    site at once -- go-oidc rejects a provider whose configured URL differs
+    from the published one, and the OTel collector's oidc extension fails
+    startup entirely when any single provider fails. Changing the string is a
+    coordinated migration. Warning about it is not.
+    """
+    cleaned = (issuer or "").strip().rstrip("/")
+    if not cleaned:
+        return cleaned
+
+    scheme, _, rest = cleaned.partition("://")
+    if not rest:
+        print(f"OIDC: issuer {cleaned!r} has no scheme. It is a protocol identifier and must be an absolute https URL.")
+        return cleaned
+
+    host = rest.split("/", 1)[0]
+    _, sep, port = host.rpartition(":")
+    if sep and port == DEFAULT_PORTS.get(scheme):
+        source = "general.webdomain" if derived else "OIDC_ISSUER"
+        print(
+            f"OIDC: issuer {cleaned!r} carries the default port for {scheme}. "
+            f"It is published verbatim and every relying party must match it exactly, "
+            f"so consider setting OIDC_ISSUER without it (from {source}). "
+            f"Do not change it without re-registering with anything that federates this frontend."
+        )
+    return cleaned
+
+
 class AuthHandler:
     """Authentication handler to manage user/pass and token-based authentication."""
 
@@ -215,8 +294,13 @@ class AuthHandler:
         # OIDC and JWKS handling
         self.gitConf = getGitConfig()
         self.oidc_app_name = os.environ.get("OIDC_APP_NAME", "SITERM Token Issuer.")
-        self.oidc_issuer = os.environ.get("OIDC_ISSUER", self.gitConf.get("general", "webdomain"))
+        self.oidc_issuer = normalizeIssuer(
+            os.environ.get("OIDC_ISSUER", self.gitConf.get("general", "webdomain")),
+            derived="OIDC_ISSUER" not in os.environ,
+        )
         self.oidc_audience = os.environ.get("OIDC_AUDIENCE", self.gitConf.get("general", "webdomain"))
+        self.oidc_extra_audience = os.environ.get("OIDC_EXTRA_AUDIENCE", "")
+        self.oidc_sitename = os.environ.get("OIDC_SITENAME", self.gitConf.get("general", "sitename", ""))
         self.oidc_algorithm = os.environ.get("OIDC_ALGORITHM", "RS256")
         self.oidc_token_lifetime_minutes = int(os.environ.get("OIDC_TOKEN_LIFETIME_MINUTES", "60"))
         self.refresh_token_ttl = timedelta(hours=int(os.environ.get("REFRESH_TOKEN_TTL_HOURS", "12"))).total_seconds()
@@ -241,6 +325,7 @@ class AuthHandler:
         """Generate a challenge for the given certificate."""
         # Challenge storage is filesystem-based (tmp), that breaks if multiple instances are running
         # or if container is restarted
+        sweep_challenges()
         try:
             cert = load_cert(input_cert)
             verify_cert_chain(input_cert, self.oidc_ca_store)
@@ -253,7 +338,7 @@ class AuthHandler:
             challenge_id = secrets.token_hex(16)
 
             tempfile = f"{getTempDir()}/m2m/{challenge_id}.json"
-            expires_at = getUTCnow() + 60
+            expires_at = getUTCnow() + CHALLENGE_TTL
 
             dumpFileContentAsJson(
                 tempfile,
@@ -477,7 +562,7 @@ class AuthHandler:
 
         payload = {
             "iss": self.oidc_issuer,
-            "aud": self.oidc_audience,
+            "aud": [self.oidc_audience, self.oidc_extra_audience] if self.oidc_extra_audience else self.oidc_audience,
             "sub": usersub,
             "iat": int(now),
             "exp": int(exp),
@@ -485,6 +570,10 @@ class AuthHandler:
 
         if "extra_claims" in kwargs:
             payload.update(kwargs["extra_claims"])
+
+        # Set after extra_claims so a caller cannot override it.
+        if self.oidc_sitename:
+            payload["sitename"] = self.oidc_sitename
 
         headers = {"kid": self.oidc_kid, "typ": "JWT"}
 

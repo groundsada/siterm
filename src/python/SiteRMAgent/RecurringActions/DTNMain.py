@@ -35,8 +35,16 @@ from SiteRMLibs.MainUtilities import (
     getUTCnow,
 )
 from SiteRMLibs.MemDiskStats import MemDiskStats
+from SiteRMLibs.OtelWrapper import (
+    getCurrentSpan,
+    getTracer,
+    setSpanStatus,
+    statusError,
+)
 
 COMPONENT = "RecurringAction"
+
+_agent_tracer = getTracer("siterm.agent.recurringaction")
 
 
 class RecurringAction:
@@ -207,7 +215,23 @@ class RecurringAction:
         return False
 
     def startwork(self):
-        """Execute main script for SiteRM Agent output preparation."""
+        """Execute main script for SiteRM Agent output preparation.
+
+        Only opens the span; _startwork does the work. ServiceWarning and
+        PluginException are raised from the end of that method to signal a
+        partial run, and they are recorded rather than swallowed -- an agent
+        that published nothing still ran, and the span should say which.
+        """
+        with _agent_tracer.start_as_current_span("agent.report_host") as span:
+            try:
+                return self._startwork()
+            except Exception as ex:
+                span.record_exception(ex)
+                setSpanStatus(span, statusError(str(ex)))
+                raise
+
+    def _startwork(self):
+        """Collect host state and publish it to the frontend."""
         workDir = self.config.get("general", "privatedir") + "/SiteRM/"
         createDirs(workDir)
         dic, excMsg, raiseError = self.prepareJsonOut()
@@ -215,6 +239,9 @@ class RecurringAction:
 
         diffFromLast = self.comparediff(dic)
         self.logger.info("Output from Agent is different from last sent: %s", diffFromLast)
+        # Most cycles publish nothing and only refresh a timestamp. Separating
+        # the two is what makes a stalled agent distinguishable from a quiet one.
+        getCurrentSpan().set_attribute("agent.state_changed", bool(diffFromLast))
         if not diffFromLast:
             self.agent.dumpFileContentAsJson(workDir + "/latest-out.json", dic)
             # No need to send same data again, we just update timestamp.

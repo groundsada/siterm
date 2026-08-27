@@ -32,7 +32,10 @@ from SiteRMLibs.MainUtilities import (
     getUTCnow,
     getVal,
 )
+from SiteRMLibs.OtelWrapper import getTracer, setSpanStatus, statusError
 from SiteRMLibs.timing import Timing
+
+_provisioning_tracer = getTracer("siterm.provisioningservice")
 
 
 class ProvisioningService(RoutingService, VirtualSwitchingService, QualityOfService, BWService, Timing):
@@ -382,24 +385,38 @@ class ProvisioningService(RoutingService, VirtualSwitchingService, QualityOfServ
 
     def startwork(self, firstrun=False):
         """Start Provisioning Service main worker."""
-        self.firstrun = firstrun
-        firstRunCheck(self.firstrun, "ProvisioningService")
-        # Get current active config;
-        self.__cleanup()
-        self._getActive()
-        # Get all for force apply
-        self._getAllForceApply()
-        self.switch.getinfo()
-        switches = self.switch.getAllSwitches()
-        self.prepareYamlConf(self.activeDeltas["output"], switches)
+        with _provisioning_tracer.start_as_current_span("provisioning.apply") as span:
+            # first_run drives a different, much longer path (apply to every
+            # device individually), so a trace is only comparable to another
+            # trace with the same value.
+            span.set_attribute("provisioning.first_run", bool(firstrun))
+            try:
+                self.firstrun = firstrun
+                firstRunCheck(self.firstrun, "ProvisioningService")
+                # Get current active config;
+                self.__cleanup()
+                self._getActive()
+                # Get all for force apply
+                self._getAllForceApply()
+                self.switch.getinfo()
+                switches = self.switch.getAllSwitches()
+                span.set_attribute("provisioning.switch_count", len(switches or []))
+                self.prepareYamlConf(self.activeDeltas["output"], switches)
 
-        # Compare individual requests and report it's states
-        configChanged = self.compareIndv(switches)
-        # Save individual uuid conf inside memory;
-        self.logger.info("Saving current active configuration inside memory")
-        self.logger.info(f"Current active configuration: {self.yamlconfuuid}")
-        self.yamlconfuuidActive = copy.deepcopy(self.yamlconfuuid)
-        return configChanged
+                # Compare individual requests and report it's states
+                configChanged = self.compareIndv(switches)
+                # Save individual uuid conf inside memory;
+                self.logger.info("Saving current active configuration inside memory")
+                self.logger.info(f"Current active configuration: {self.yamlconfuuid}")
+                self.yamlconfuuidActive = copy.deepcopy(self.yamlconfuuid)
+                # The question asked of this span most often is "did this cycle
+                # change anything", which separates a slow no-op from real work.
+                span.set_attribute("provisioning.config_changed", bool(configChanged))
+                return configChanged
+            except Exception as ex:
+                span.record_exception(ex)
+                setSpanStatus(span, statusError(str(ex)))
+                raise
 
 
 def execute(config=None, args=None):

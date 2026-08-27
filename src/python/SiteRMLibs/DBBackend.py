@@ -12,6 +12,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from SiteRMLibs.DBModels import REGISTRY, Base
+from SiteRMLibs.OtelWrapper import otelEnabled
 from sqlalchemy import URL, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
@@ -89,6 +90,28 @@ class DBBackend:
         self.autocommit = os.getenv("MARIA_DB_AUTOCOMMIT", "True") in ("True", "true", "1")
         self.engine = create_engine(self.database_url, pool_pre_ping=True, future=True)
         self.Session = sessionmaker(bind=self.engine, autoflush=False, expire_on_commit=False)
+        self._instrumentOtel()
+
+    def _instrumentOtel(self):
+        """Attach OpenTelemetry to this engine so DB time shows up inside
+        request and daemon-run spans. Scoped to this engine rather than global,
+        so nothing is patched when tracing is off.
+
+        Never allowed to break the database: a telemetry import or version
+        problem must not stop SiteRM from talking to MariaDB.
+        """
+        if not otelEnabled():
+            return
+        try:
+            # Imported here, not at module scope: the instrumentation package is
+            # optional, and OtelWrapper deliberately does not depend on it.
+            from opentelemetry.instrumentation.sqlalchemy import (  # pylint: disable=import-outside-toplevel
+                SQLAlchemyInstrumentor,
+            )
+
+            SQLAlchemyInstrumentor().instrument(engine=self.engine)
+        except Exception as ex:
+            print(f"OpenTelemetry SQLAlchemy instrumentation skipped. Error: {ex}")
 
     @contextmanager
     def session(self):

@@ -224,7 +224,10 @@ async def token_challenge(
         verified, user = deps["authHandler"].verify_challenge(challenge_id, item.signature, client_ip=clientIP)
 
         if not verified:
-            raise BadRequestError("Invalid challenge outcome")
+            # IssuesWithAuth, not BadRequestError: only the former is mapped to
+            # 401 below, so an unknown, expired, replayed or badly signed
+            # challenge was answered with 500 and read as a frontend fault.
+            raise IssuesWithAuth("Invalid challenge outcome")
 
         # Check that user is defined correctly
         if not user or "permissions" not in user or "username" not in user["permissions"]:

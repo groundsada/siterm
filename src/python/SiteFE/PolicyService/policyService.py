@@ -54,7 +54,15 @@ from SiteRMLibs.MainUtilities import (
     parseRDFFile,
     writeActiveDeltas,
 )
+from SiteRMLibs.OtelWrapper import (
+    getTracer,
+    linksFromTraceparent,
+    setSpanStatus,
+    statusError,
+)
 from SiteRMLibs.timing import Timing
+
+_delta_tracer = getTracer("siterm.policyservice")
 
 
 def getError(ex):
@@ -1032,32 +1040,48 @@ class PolicyService(RDFHelper, Timing, BWService):
         toDict["State"] = "accepting"
         toDict["Type"] = "submission"
         toDict["modadd"] = "idle"
-        try:
-            self._addDeltasToModel(currentGraph, toDict.get("content", {}))
-            self.newActive["output"] = self.parseModel(currentGraph)
+        # #4: acceptDelta runs in the PolicyService daemon poll, a SEPARATE
+        # process and span from the request that submitted the delta. The
+        # submitter persisted its traceparent in the file; link back to it so
+        # this work hangs off the originating trace instead of an orphan under
+        # the poll root.
+        _delta_traceparent = fileContent.get("traceparent", "")
+        with _delta_tracer.start_as_current_span(
+            "acceptDelta",
+            attributes={"delta.path": deltapath, "delta.traceparent": _delta_traceparent},
+            # Keyed on whether the traceparent PARSED, not merely on it being
+            # non-empty -- a truncated or corrupt value in the delta file
+            # previously produced Link(None).
+            links=linksFromTraceparent(_delta_traceparent),
+        ) as _accept_span:
             try:
-                self.conflictChecker.checkConflicts(self, self.newActive["output"], self.currentActive["output"], True)
-            except (OverlapException, WrongIPAddress, ServiceNotReady) as ex:
-                self.logger.info(f"There was failure accepting delta. Failure {ex}")
+                self._addDeltasToModel(currentGraph, toDict.get("content", {}))
+                self.newActive["output"] = self.parseModel(currentGraph)
+                try:
+                    self.conflictChecker.checkConflicts(self, self.newActive["output"], self.currentActive["output"], True)
+                except (OverlapException, WrongIPAddress, ServiceNotReady) as ex:
+                    self.logger.info(f"There was failure accepting delta. Failure {ex}")
+                    toDict["State"] = "failed"
+                    toDict["Error"] = getError(ex)
+                    self.stateMachine.failed(self.dbI, toDict)
+                    return toDict
+                except Exception as ex:
+                    self.logger.error(f"Unexpected error during delta acceptance: {ex}")
+                    self.logger.error(f"Full traceback: {traceback.format_exc()}")
+                    _accept_span.record_exception(ex)
+                    setSpanStatus(_accept_span, statusError())
+                    toDict["State"] = "failed"
+                    toDict["Error"] = getError(ex)
+                    self.stateMachine.failed(self.dbI, toDict)
+                    return toDict
+            except IOError as ex:
                 toDict["State"] = "failed"
                 toDict["Error"] = getError(ex)
                 self.stateMachine.failed(self.dbI, toDict)
-                return toDict
-            except Exception as ex:
-                self.logger.error(f"Unexpected error during delta acceptance: {ex}")
-                self.logger.error(f"Full traceback: {traceback.format_exc()}")
-                toDict["State"] = "failed"
-                toDict["Error"] = getError(ex)
-                self.stateMachine.failed(self.dbI, toDict)
-                return toDict
-        except IOError as ex:
-            toDict["State"] = "failed"
-            toDict["Error"] = getError(ex)
-            self.stateMachine.failed(self.dbI, toDict)
-        else:
-            toDict["State"] = "accepted"
-            self.stateMachine.accepting(self.dbI, toDict)
-            # =================================
+            else:
+                toDict["State"] = "accepted"
+                self.stateMachine.accepting(self.dbI, toDict)
+                # =================================
         return toDict
 
 

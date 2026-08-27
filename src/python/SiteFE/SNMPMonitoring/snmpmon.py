@@ -22,12 +22,20 @@ Date: 2022/11/21
 import copy
 import os
 import sys
+import time
+
+import requests
 
 from easysnmp import Session
 from easysnmp.exceptions import EasySNMPTimeoutError, EasySNMPUnknownObjectIDError
-from prometheus_client import CollectorRegistry, Enum, Gauge, Info, generate_latest
+from prometheus_client import CollectorRegistry, generate_latest
+from SiteRMLibs.MetricsBridge import DualEnum, DualGauge, DualInfo
+from SiteRMLibs.OtelHealth import renderInto as renderOtelHealth
+from SiteRMLibs.OtelMetrics import getGauge, getHistogram, initMetrics
+from SiteRMLibs.NodeExporterPush import nodeExporterUrl, parseSamples
 from SiteRMLibs.Backends.main import Switch
 from SiteRMLibs.DefaultParams import SERVICE_DEAD_TIMEOUT, SERVICE_DOWN_TIMEOUT
+from SiteRMLibs.DeltaMetrics import DeltaMetrics
 from SiteRMLibs.GitConfig import getGitConfig
 from SiteRMLibs.MainUtilities import (
     contentDB,
@@ -43,7 +51,15 @@ from SiteRMLibs.MainUtilities import (
     jsondumps,
 )
 from SiteRMLibs.MemDiskStats import MemDiskStats
+from SiteRMLibs.OtelWrapper import getTracer, setSpanStatus, statusError
 from SiteRMLibs.Warnings import Warnings
+
+_snmp_tracer = getTracer("siterm.snmpmonitoring")
+
+# A DTN's node_exporter answers in milliseconds on a healthy host. This is short
+# on purpose: the poll runs at the end of the monitoring cycle and a hung DTN
+# must not hold the next one up.
+NODE_EXPORTER_TIMEOUT = 10
 
 
 class Topology:
@@ -99,6 +115,11 @@ class Topology:
                     incr += 1
         return wan_links
 
+    # pylint: disable=too-many-locals,too-many-branches
+    # Pre-existing, and left alone deliberately: splitting this up is a real
+    # refactor of untested topology code, and it has nothing to do with the
+    # telemetry work carrying this file. Scoped to this method so the limits
+    # still apply to everything else here.
     def gettopology(self):
         """Return all Switches information"""
 
@@ -289,6 +310,14 @@ class PromOut:
             "Hostname": "",
         }
         self.snmpdir = os.path.join(self.config.get(sitename, "privatedir"), "SNMPData")
+        # The meter provider lives in THIS process, not the REST process: the
+        # REST layer only serves the snmpinfo.txt this class writes. Building it
+        # here is what gives the DualGauge/DualInfo/DualEnum instruments
+        # somewhere to record, and it is idempotent.
+        initMetrics("siterm-snmpmon")
+        # Delta lifecycle, derived from the append-only state history. Placed in
+        # this cycle so it reuses the existing cadence rather than adding one.
+        self.deltametrics = DeltaMetrics(self.dbI)
 
     @staticmethod
     def __cleanRegistry():
@@ -302,7 +331,7 @@ class PromOut:
 
     def __memStats(self, registry):
         """Refresh all Memory Statistics in FE"""
-        memInfo = Gauge(
+        memInfo = DualGauge(
             "memory_usage",
             "Memory Usage for Service",
             ["servicename", "key", "hostname"],
@@ -320,7 +349,7 @@ class PromOut:
 
     def __diskStats(self, registry):
         """Refresh all Disk Statistics in FE"""
-        diskGauge = Gauge(
+        diskGauge = DualGauge(
             "disk_usage",
             "Disk usage statistics for each filesystem",
             ["filesystem", "key", "hostname"],
@@ -351,22 +380,33 @@ class PromOut:
 
     def __getAgentData(self, registry):
         """Add Agent Data (Cert validity) to prometheus output"""
-        agentCertValid = Gauge(
+        agentCertValid = DualGauge(
             "agent_cert",
             "Agent Certificate Validity",
             ["hostname", "Key"],
             registry=registry,
         )
-        arpState = Gauge(
+        arpState = DualGauge(
             "arp_state",
             "ARP Address Table for Host",
             labelnames=self.arpLabels.keys(),
             registry=registry,
         )
+        # Emitted before the timeout check, deliberately. Everything below
+        # disappears once a host goes quiet, so a stale host and a host that
+        # never existed look identical; this one series keeps saying how old
+        # the data is instead of vanishing with it.
+        hostLastSeen = DualGauge(
+            "siterm_host_last_seen_timestamp_seconds",
+            "When the agent on this host last reported",
+            ["hostname"],
+            registry=registry,
+        )
         for host, hostDict in getAllHosts(self.dbI).items():
             hostDict["hostinfo"] = self.diragent.getFileContentAsJson(hostDict["hostinfo"])
+            hostLastSeen.labels(hostname=host).set(hostDict["updatedate"])
             if int(self.timenow - hostDict["updatedate"]) > SERVICE_DOWN_TIMEOUT:
-                self.logger.warning(f"Host {host} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
+                self.logger.warning("Host %s did not update in the last %s minutes. Skipping.", host, SERVICE_DOWN_TIMEOUT // 60)
                 continue
             if "CertInfo" in hostDict.get("hostinfo", {}).keys():
                 for key in ["notAfter", "notBefore"]:
@@ -378,7 +418,7 @@ class PromOut:
     def __getSwitchErrors(self, registry):
         """Add Switch Errors to prometheus output"""
         dbOut = self.dbI.get("switch")
-        switchErrorsGauge = Gauge(
+        switchErrorsGauge = DualGauge(
             "switch_errors",
             "Switch Errors",
             ["hostname", "errortype"],
@@ -391,27 +431,50 @@ class PromOut:
                     labels = {"errortype": errorkey, "hostname": item["device"]}
                     switchErrorsGauge.labels(**labels).set(len(errors))
 
+    @staticmethod
+    def _addMacTable(macState, hostname, val):
+        """Emit one mac_table series per address, numbered within its vlan.
+
+        The isinstance guard keeps the old `"vlans" in val` behaviour: that test
+        is False rather than an error when the payload is not a mapping.
+        """
+        if not isinstance(val, dict):
+            return
+        for vlan, macs in val.get("vlans", {}).items():
+            for incr, macaddr in enumerate(macs):
+                labels = {"vlan": vlan, "hostname": hostname, "incr": str(incr)}
+                macState.labels(**labels).info({"macaddress": macaddr})
+
     def __getSNMPData(self, registry):
         """Add SNMP Data to prometheus output"""
         # Here get info from DB for switch snmp details
         snmpData = self.dbI.get("snmpmon")
         if not snmpData:
             return
-        snmpGauge = Gauge(
+        snmpGauge = DualGauge(
             "interface_statistics",
             "Interface Statistics",
             ["ifDescr", "ifType", "ifAlias", "hostname", "Key"],
             registry=registry,
         )
-        macState = Info(
+        macState = DualInfo(
             "mac_table",
             "Mac Address Table",
             labelnames=["vlan", "hostname", "incr"],
             registry=registry,
         )
+        # Same reason as siterm_host_last_seen_timestamp_seconds: emitted above
+        # the timeout so a switch that stopped answering stays visible.
+        snmpLastPoll = DualGauge(
+            "siterm_snmp_last_poll_timestamp_seconds",
+            "When SNMP data for this device was last collected",
+            ["hostname"],
+            registry=registry,
+        )
         for item in snmpData:
+            snmpLastPoll.labels(hostname=item["hostname"]).set(item["updatedate"])
             if int(self.timenow - item["updatedate"]) > SERVICE_DOWN_TIMEOUT:
-                self.logger.warning(f"SNMP {item['hostname']} did not update in the last {SERVICE_DOWN_TIMEOUT // 60} minutes. Skipping.")
+                self.logger.warning("SNMP %s did not update in the last %s minutes. Skipping.", item["hostname"], SERVICE_DOWN_TIMEOUT // 60)
                 continue
             out = evaldict(item.get("output", {}))
             # Skip hostnamemem- and hostnamedisk- devices. This is covered in __memStats/__diskStats
@@ -423,17 +486,7 @@ class PromOut:
                 continue
             for key, val in out.items():
                 if key == "macs":
-                    if "vlans" in val:
-                        for key1, macs in val["vlans"].items():
-                            incr = 0
-                            for macaddr in macs:
-                                labels = {
-                                    "vlan": key1,
-                                    "hostname": item["hostname"],
-                                    "incr": str(incr),
-                                }
-                                macState.labels(**labels).info({"macaddress": macaddr})
-                                incr += 1
+                    self._addMacTable(macState, item["hostname"], val)
                     continue
                 keys = {
                     "ifDescr": val.get("ifDescr", ""),
@@ -476,7 +529,7 @@ class PromOut:
                 out[key] = item.get(key, "")
             return out
 
-        netState = Enum(
+        netState = DualEnum(
             "network_status",
             "Network Status information",
             labelnames=labelnames,
@@ -491,7 +544,7 @@ class PromOut:
             ],
             registry=registry,
         )
-        qosGauge = Gauge("qos_status", "QoS Requests Status", labelqos, registry=registry)
+        qosGauge = DualGauge("qos_status", "QoS Requests Status", labelqos, registry=registry)
 
         currentActive = getActiveDeltas(self)
         for item in self.activeAPI.generateReport(currentActive):
@@ -513,20 +566,20 @@ class PromOut:
 
     def __getServiceStates(self, registry):
         """Get all Services states."""
-        serviceState = Enum(
+        serviceState = DualEnum(
             "service_state",
             "Description of enum",
             labelnames=["servicename", "hostname"],
             states=["OK", "WARNING", "UNKNOWN", "FAILED", "KEYBOARDINTERRUPT", "UNSET"],
             registry=registry,
         )
-        runtimeInfo = Gauge(
+        runtimeInfo = DualGauge(
             "service_runtime",
             "Service Runtime",
             ["servicename", "hostname"],
             registry=registry,
         )
-        infoState = Info(
+        infoState = DualInfo(
             "running_version",
             "Running Code Version.",
             labelnames=["servicename", "hostname"],
@@ -555,12 +608,40 @@ class PromOut:
         self.__diskStats(registry)
         self.__getSwitchErrors(registry)
         self.__getActiveQoSStates(registry)
+        # Health of the export path itself, on the pull path deliberately: a
+        # metric saying "telemetry is not reaching the gateway" must not travel
+        # over the path that is broken.
+        renderOtelHealth(registry)
+
+    def __freshness(self, registry, started):
+        """When this file was built, and how long that took.
+
+        Scrape freshness is not data freshness. The REST layer serves the
+        snmpinfo.txt this class writes, so a scrape succeeds at the usual
+        interval whether or not anything is still updating the file -- and a
+        panel cannot tell a real 0 from an exporter that died 40 minutes ago.
+        """
+        generated = DualGauge(
+            "siterm_metrics_generated_timestamp_seconds",
+            "When the metrics file was last built",
+            registry=registry,
+        )
+        generated.set(self.timenow)
+        duration = DualGauge(
+            "siterm_exporter_build_duration_seconds",
+            "How long the last metrics build took",
+            registry=registry,
+        )
+        duration.set(time.time() - started)
 
     def metrics(self):
         """Return all available Hosts, where key is IP address."""
         self.refreshTimeNow()
         registry = self.__cleanRegistry()
+        started = time.time()
         self.__getServiceStates(registry)
+        self.deltametrics.collect(self.timenow)
+        self.__freshness(registry, started)
         data = generate_latest(registry)
         del registry  # Explicit dereference of Collector Registry
         fname = os.path.join(self.snmpdir, "snmpinfo.txt")
@@ -605,13 +686,13 @@ class SNMPMonitoring(Warnings):
         self.hostconf[host] = self.switch.plugin.getHostConfig(host)
         if self.config.config["MAIN"].get(host, {}).get("external_snmp", ""):
             snmphost = self.config.config["MAIN"][host]["external_snmp"]
-            self.logger.info(f"SNMP Scan skipped for {host}. Remote endpoint defined: {snmphost}")
+            self.logger.info("SNMP Scan skipped for %s. Remote endpoint defined: %s", host, snmphost)
             return
         if "snmp_monitoring" not in self.hostconf[host]:
-            self.logger.info(f"Ansible host: {host} config does not have snmp_monitoring parameters")
+            self.logger.info("Ansible host: %s config does not have snmp_monitoring parameters", host)
             return
         if "session_vars" not in self.hostconf[host]["snmp_monitoring"]:
-            self.logger.info(f"Ansible host: {host} config does not have session_vars parameters")
+            self.logger.info("Ansible host: %s config does not have session_vars parameters", host)
             return
         # easysnmp does not support ipv6 and will fail with ValueError (unable to unpack)
         # To avoid this, we will bypass ipv6 check if error is raised.
@@ -648,7 +729,7 @@ class SNMPMonitoring(Warnings):
         # FRR - runs on top of linux, so we will get mac addresses via ansible
         updatedate = self.switch.switches.get("output", {}).get(host, {}).get("dbinfo", {}).get("updatedate", 0)
         if (getUTCnow() - updatedate) > 1200:
-            self.logger.info(f"[{host}]: Forcing ansible to update device information")
+            self.logger.info("[%s]: Forcing ansible to update device information", host)
             self.switch.deviceUpdate(self.sitename, host)
         self.switch.getinfo()
         mactable = self.switch.output.get("mactable", {}).get(host, {})
@@ -738,10 +819,35 @@ class SNMPMonitoring(Warnings):
         self._writeToDB("hostnamedisk-fe", self.memdisk.getStorageInfo())
 
     def startwork(self):
+        """Scan all switches and get snmp data.
+
+        Only opens the span; _startwork does the polling. Kept separate for the
+        same reason as LookUpService -- so the span costs no reindent.
+
+        Per-switch timing is deliberately NOT a child span. It is already
+        siterm_snmp_poll_duration_seconds, labelled by hostname, and a span per
+        switch per cycle would carry the same answer at much higher volume.
+        """
+        with _snmp_tracer.start_as_current_span("snmp.poll") as span:
+            span.set_attribute("snmp.switch_count", len(self.switches or []))
+            try:
+                self._startwork()
+                # Switches configured but unreachable are the interesting gap:
+                # they produce no error here, they simply never get a session.
+                span.set_attribute("snmp.warning_count", len(self.lastrunwarnings or []))
+                return None
+            except Exception as ex:
+                span.record_exception(ex)
+                setSpanStatus(span, statusError(str(ex)))
+                raise
+
+    def _startwork(self):
         """Scan all switches and get snmp data"""
         self._start()
         macs = {}
+        pollDuration = getHistogram("siterm_snmp_poll_duration_seconds", "Wall time of one switch SNMP poll")
         for host in self.switches:
+            pollStart = time.time()
             self._getSNMPSession(host)
             if not self.session:
                 continue
@@ -751,25 +857,67 @@ class SNMPMonitoring(Warnings):
             for key in self.config["MAIN"]["snmp"]["mibs"]:
                 allvals = self._getSNMPVals(key, host)
                 if len(self.lastrunwarnings) > 3:
-                    self.logger.error(f"[{host}]: Too many SNMP errors ({self.lastrunwarnings}), skipping further SNMP queries")
+                    self.logger.error("[%s]: Too many SNMP errors (%s), skipping further SNMP queries", host, self.lastrunwarnings)
                     break
                 for item in allvals:
-                    indx = item.oid_index
-                    out.setdefault(indx, {})
-                    out[indx][key] = item.value.replace("\x00", "")
+                    index = item.oid_index
+                    out.setdefault(index, {})
+                    out[index][key] = item.value.replace("\x00", "")
             out["macs"] = macs[host]
             self._writeToDB(host, out)
-        self.logger.info(f"[{self.sitename}]: SNMP Monitoring finished for {len(self.switches)} switches")
+            pollDuration.record(time.time() - pollStart, {"hostname": host})
+        self.logger.info("[%s]: SNMP Monitoring finished for %s switches", self.sitename, len(self.switches))
         # Get Memory and Disk Statistics
         self.getMemStats()
-        self.logger.info(f"[{self.sitename}]: Memory statistics written to DB")
+        self.logger.info("[%s]: Memory statistics written to DB", self.sitename)
         self.getDiskStats()
-        self.logger.info(f"[{self.sitename}]: Disk statistics written to DB")
+        self.logger.info("[%s]: Disk statistics written to DB", self.sitename)
         # Set Prometheus output
         self.prom.metrics()
         # Set Topology json
         self.topo.gettopology()
-        self.logger.info(f"[{self.sitename}]: Topology map written to DB")
+        self.logger.info("[%s]: Topology map written to DB", self.sitename)
+        self.pushNodeExporter()
+
+    def pushNodeExporter(self):
+        """Poll each DTN's node_exporter and push what it returns.
+
+        Lives here because this is the frontend's periodic monitoring collector
+        -- it already gathers memory and disk statistics, which are no more
+        about switches than these are -- and it already holds a DB handle and
+        runs on a cycle. A separate daemon would need its own launcher script
+        and a supervisord entry in siterm-startup for a job measured in
+        milliseconds.
+
+        Gated per host on `node_exporter_passthrough`, the flag SENSE's own docs
+        already tell sites to set. That keeps the scope to hosts that have
+        deliberately opted into the frontend reaching them, and it means turning
+        this on does not silently start polling a DTN nobody expected.
+
+        Never raises. This runs at the end of a cycle that has already written
+        everything else it needed to, and a DTN that is down must not cost the
+        switch poll its run.
+        """
+        pushed = 0
+        for hostname, hostdata in getAllHosts(self.dbI).items():
+            try:
+                hostinfo = self.diragent.getFileContentAsJson(hostdata.get("hostinfo", ""))
+                general = hostinfo.get("Summary", {}).get("config", {}).get("general", {})
+                if not general.get("node_exporter_passthrough", False):
+                    continue
+                url = nodeExporterUrl(general.get("node_exporter", ""))
+                if not url:
+                    continue
+                response = requests.get(url, timeout=NODE_EXPORTER_TIMEOUT)
+                response.raise_for_status()
+                for name, attributes, value in parseSamples(response.text, hostname):
+                    getGauge(name, "Relayed from this host's node_exporter").set(value, attributes)
+                pushed += 1
+            except Exception as ex:  # pylint: disable=broad-except
+                # One unreachable DTN is normal and must not stop the others.
+                self.logger.warning("[%s]: node_exporter push failed for %s: %s", self.sitename, hostname, ex)
+        if pushed:
+            self.logger.info("[%s]: node_exporter metrics pushed for %s host(s)", self.sitename, pushed)
 
 
 def execute(config=None, args=None):

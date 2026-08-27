@@ -345,8 +345,8 @@ class Requests:
             url = urllib.parse.urljoin(self.host, uri)
         return url
 
-    def __makeSiteRMHTTPCall(self, url, verb, **kwargs):
-        """Make an HTTP request to the SiteRM Frontend."""
+    def ensureBearerToken(self):
+        """Return a valid Bearer token, acquiring or renewing it if needed."""
         if not self.bearertoken or self._expiredBearerToken():
             response = self.session.request(method="GET", url=urllib.parse.urljoin(self.host, "/.well-known/openid-configuration"))
             if response.status_code == 200:
@@ -355,6 +355,11 @@ class Requests:
             else:
                 self._logMessage(f"Failed to get authentication method from /.well-known/openid-configuration: {response.status_code} {response.reason_phrase}")
                 raise HTTPException(f"Failed to get authentication method from /.well-known/openid-configuration: {response.status_code} {response.reason_phrase}")
+        return self.bearertoken
+
+    def __makeSiteRMHTTPCall(self, url, verb, **kwargs):
+        """Make an HTTP request to the SiteRM Frontend."""
+        self.ensureBearerToken()
         kwargs.setdefault("headers", {})
         kwargs["headers"]["Authorization"] = f"Bearer {self.bearertoken}"
         response = self.session.request(

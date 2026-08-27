@@ -9,9 +9,6 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from opentelemetry import trace
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.trace import Status, StatusCode
 from SiteFE.REST.Auth import router as auth_router
 from SiteFE.REST.Debug import router as debug_router
 from SiteFE.REST.Delta import router as delta_router
@@ -19,24 +16,45 @@ from SiteFE.REST.Frontend import router as fe_router
 from SiteFE.REST.Host import router as host_router
 from SiteFE.REST.Model import router as model_router
 from SiteFE.REST.Monitoring import router as monitoring_router
+from SiteFE.REST.Otlp import router as otlp_router
 from SiteFE.REST.Service import router as service_router
 from SiteFE.REST.Topo import router as topo_router
 from SiteRMLibs.MainUtilities import envBool, loadEnvFile
-from SiteRMLibs.OpenTelemetry import init_otel
+from SiteRMLibs.OpenTelemetry import init_otel, otelEnabled
+from SiteRMLibs.OtelWrapper import (
+    getCurrentSpan,
+    getTracer,
+    setSpanStatus,
+    statusError,
+)
 
 loadEnvFile()
 
 app = FastAPI()
 
-OTEL_ENABLED = envBool("OTEL_ENABLED", False)
+OTEL_ENABLED = otelEnabled()
+
+# Request bodies are deltas -- topology and configuration -- so they are not
+# exported by default. Enabling this also makes the middleware consume the
+# request stream, which BaseHTTPMiddleware buffers in full; that path is only
+# worth taking when someone is actively debugging.
+OTEL_CAPTURE_BODY = envBool("OPENTELEMETRY_DEBUG", False)
+OTEL_BODY_MAXLEN = int(os.getenv("OTEL_BODY_MAXLEN", "1024"))
 
 if OTEL_ENABLED:
     init_otel("siterm-site-fe")
-    FastAPIInstrumentor.instrument_app(
-        app,
-        http_capture_headers_server_request=["user-agent", "if-modified-since", "accept", "sense-request-host", "sense-request-email", "sense-request-fullname", "sense-request-organization"],
-        http_capture_headers_server_response=["content-type", "content-length", "cache-control"],
-    )
+    try:
+        # Optional dependency: a frontend without the instrumentation package
+        # still serves requests, just without server spans.
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(
+            app,
+            http_capture_headers_server_request=["user-agent", "if-modified-since", "accept"],
+            http_capture_headers_server_response=["content-type", "content-length", "cache-control"],
+        )
+    except ImportError as ex:
+        print(f"OpenTelemetry FastAPI instrumentation skipped. Error: {ex}")
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
@@ -49,6 +67,7 @@ app.include_router(debug_router, prefix="/api")
 app.include_router(topo_router, prefix="/api")
 app.include_router(monitoring_router, prefix="/api")
 app.include_router(service_router, prefix="/api")
+app.include_router(otlp_router, prefix="/api")
 
 app.mount("/", StaticFiles(directory=os.getenv("SITERM_STATIC_DIR", "/var/www/html"), html=True), name="ui")
 
@@ -60,10 +79,10 @@ async def exception_capture(request: Request, call_next):
         return await call_next(request)
     except Exception as exc:
         if OTEL_ENABLED:
-            span = trace.get_current_span()
+            span = getCurrentSpan()
             if span:
                 span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR))
+                setSpanStatus(span, statusError())
         raise
 
 
@@ -73,7 +92,7 @@ async def observability_middleware(request: Request, call_next):
     if not OTEL_ENABLED:
         return await call_next(request)
 
-    tracer = trace.get_tracer("siterm.api")
+    tracer = getTracer("siterm.api")
 
     start_time = time.time()
 
@@ -84,13 +103,14 @@ async def observability_middleware(request: Request, call_next):
         span.set_attribute("http.client_ip", request.client.host if request.client else "unknown")
 
         try:
-            # capture request body (optional)
-            body = await request.body()
-            if body:
-                try:
-                    span.set_attribute("http.request.body", body.decode("utf-8")[:4096])
-                except Exception:
-                    span.set_attribute("http.request.body", "<binary>")
+            # capture request body (optional, debug only -- see OTEL_CAPTURE_BODY)
+            if OTEL_CAPTURE_BODY:
+                body = await request.body()
+                if body:
+                    try:
+                        span.set_attribute("http.request.body", body.decode("utf-8")[:OTEL_BODY_MAXLEN])
+                    except Exception:
+                        span.set_attribute("http.request.body", "<binary>")
 
             response = await call_next(request)
 
@@ -103,7 +123,7 @@ async def observability_middleware(request: Request, call_next):
 
         except Exception as exc:
             span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR))
+            setSpanStatus(span, statusError())
             raise
 
 
