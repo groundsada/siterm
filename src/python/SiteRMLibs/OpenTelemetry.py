@@ -98,7 +98,9 @@ def _instrumentHttpx():
     the traces.
     """
     try:
-        from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+        from opentelemetry.instrumentation.httpx import (  # pylint: disable=import-outside-toplevel
+            HTTPXClientInstrumentor,
+        )
 
         HTTPXClientInstrumentor().instrument()
     except Exception as ex:  # pragma: no cover

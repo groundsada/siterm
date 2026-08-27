@@ -60,6 +60,7 @@ class UrlTestCase(unittest.TestCase):
         self.assertEqual(nodeExporterUrl("dtn01:9100"), "http://dtn01:9100/metrics")
 
     def testFullUrlIsLeftAlone(self):
+        """A value already in URL form must pass through untouched."""
         self.assertEqual(nodeExporterUrl("http://dtn01:9100/metrics"), "http://dtn01:9100/metrics")
 
     def testHttpsIsPreserved(self):
@@ -67,6 +68,7 @@ class UrlTestCase(unittest.TestCase):
         self.assertEqual(nodeExporterUrl("https://dtn01:9100"), "https://dtn01:9100/metrics")
 
     def testTrailingSlashDoesNotDoubleUp(self):
+        """host:9100/ must not become host:9100//metrics."""
         self.assertEqual(nodeExporterUrl("http://dtn01:9100/"), "http://dtn01:9100/metrics")
 
     def testEmptyIsEmpty(self):
@@ -80,6 +82,7 @@ class FilterTestCase(unittest.TestCase):
     """node_exporter emits far more than the dashboards reference."""
 
     def testDashboardFamiliesAreKept(self):
+        """The families the panels actually reference must survive the filter."""
         for name in ("node_cpu_seconds_total", "node_memory_MemFree_bytes", "node_load1"):
             with self.subTest(name=name):
                 self.assertTrue(wanted(name))
@@ -103,6 +106,7 @@ class ParseTestCase(unittest.TestCase):
         self.byname = byName(self.samples)
 
     def testGaugeParsed(self):
+        """The simplest family: one sample, no labels."""
         self.assertEqual(self.byname["node_load1"][0][1], 0.55)
 
     def testCounterKeepsTheTotalSuffix(self):
@@ -117,6 +121,7 @@ class ParseTestCase(unittest.TestCase):
         self.assertIn(attributes["cpu"], {"0", "1"})
 
     def testScientificNotationParsed(self):
+        """node_exporter writes large byte counts as 1.2345e+10."""
         self.assertEqual(self.byname["node_filesystem_avail_bytes"][0][1], 1.2345e10)
 
     def testHostnameIsAttachedToEverySample(self):
@@ -135,6 +140,7 @@ class ParseTestCase(unittest.TestCase):
         self.assertNotIn("node_scrape_collector_duration_seconds", self.byname)
 
     def testUnwantedFamilyIsAbsent(self):
+        """A filtered family must not reach the samples at all."""
         self.assertNotIn("go_gc_duration_seconds", self.byname)
 
     def testEmptyInputIsEmpty(self):

@@ -16,6 +16,10 @@ to work out why the gateway is unreachable would be the ones that went with it.
 Degrades to a no-op when the SDK is absent, like the rest of the otel modules.
 """
 
+# Optional packages are imported where they are used, not at module scope: that
+# deferral is what keeps them optional.
+# pylint: disable=import-outside-toplevel
+
 import logging
 import os
 import threading

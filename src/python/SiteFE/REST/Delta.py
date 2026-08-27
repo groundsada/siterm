@@ -349,10 +349,14 @@ async def submitDelta(
         ]:
             deps["dbI"].delete("deltas", [["uid", delta["uid"]]])
     reqspan = getCurrentSpan()
-    reqspan.set_attribute("delta.id", item.id)
-    reqspan.set_attribute("delta.sitename", sitename)
-    reqspan.set_attribute("delta.has_addition", bool(item.addition))
-    reqspan.set_attribute("delta.has_reduction", bool(item.reduction))
+    reqspan.set_attributes(
+        {
+            "delta.id": item.id,
+            "delta.sitename": sitename,
+            "delta.has_addition": bool(item.addition),
+            "delta.has_reduction": bool(item.reduction),
+        }
+    )
 
     try:
         # Get latest model, and check if modelId is same as latest
@@ -395,8 +399,7 @@ async def submitDelta(
         f"{item.id}.json",
     )
     with TRACER.start_as_current_span("delta.persist") as pspan:
-        pspan.set_attribute("delta.model_id", str(item.modelId))
-        pspan.set_attribute("delta.traceparent", outContent["traceparent"])
+        pspan.set_attributes({"delta.model_id": str(item.modelId), "delta.traceparent": outContent["traceparent"]})
         # Identity comes from the AUTHENTICATED principal (JWT subject), never
         # from the unauthenticated sense-request-* headers (#2).
         if deps.get("user", {}).get("user_info", {}).get("sub"):
@@ -412,8 +415,7 @@ async def submitDelta(
     # PolicyService picks the delta up from httpnew/ and writes its result to
     # httpfinished/. Nearly all submit latency lives in this poll, and it is
     # the handoff between the two services, so it gets its own span.
-    with TRACER.start_as_current_span("delta.await_policyservice") as wspan:
-        wspan.set_attribute("delta.timeout_s", timer)
+    with TRACER.start_as_current_span("delta.await_policyservice", attributes={"delta.timeout_s": timer}) as wspan:
         while timer > 0:
             if os.path.isfile(finishedName):
                 out = getFileContentAsJson(finishedName)
@@ -421,8 +423,7 @@ async def submitDelta(
                 break
             timer -= 1
             sleep(1)
-        wspan.set_attribute("delta.wait_s", 50 - timer)
-        wspan.set_attribute("delta.timed_out", bool(timer == 0 and not out))
+        wspan.set_attributes({"delta.wait_s": 50 - timer, "delta.timed_out": bool(timer == 0 and not out)})
     # If timer reached 0, we will not have file in finished directory
     if timer == 0 and not out:
         # Return failed http code

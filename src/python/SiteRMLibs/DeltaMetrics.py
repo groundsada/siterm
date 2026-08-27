@@ -38,7 +38,7 @@ ERROR_STATES = {"failed", "activate-error", "deactivate-error"}
 MAX_STUCK_SERIES = 20
 
 
-class DeltaMetrics:
+class DeltaMetrics:  # pylint: disable=too-many-instance-attributes
     """Reads the state history and records the lifecycle signals.
 
     One instance per exporter process; it keeps the watermarks that make the

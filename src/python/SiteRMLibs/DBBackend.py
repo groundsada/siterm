@@ -105,7 +105,9 @@ class DBBackend:
         try:
             # Imported here, not at module scope: the instrumentation package is
             # optional, and OtelWrapper deliberately does not depend on it.
-            from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+            from opentelemetry.instrumentation.sqlalchemy import (  # pylint: disable=import-outside-toplevel
+                SQLAlchemyInstrumentor,
+            )
 
             SQLAlchemyInstrumentor().instrument(engine=self.engine)
         except Exception as ex:

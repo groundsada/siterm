@@ -24,6 +24,10 @@ Hence: units stay "" and go in the name, counters carry `_total` explicitly
 Degrades to no-ops when the SDK is absent.
 """
 
+# Optional packages are imported where they are used, not at module scope: that
+# deferral is what keeps them optional.
+# pylint: disable=import-outside-toplevel
+
 import os
 import threading
 

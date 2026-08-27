@@ -223,7 +223,7 @@ def attachOtelLogHandler(logger, service):
     one.
     """
     try:
-        from SiteRMLibs.OtelLogs import attachHandler
+        from SiteRMLibs.OtelLogs import attachHandler  # pylint: disable=import-outside-toplevel
 
         attachHandler(logger, service)
     except ImportError:

@@ -1078,7 +1078,6 @@ class PolicyService(RDFHelper, Timing, BWService):
                 toDict["State"] = "failed"
                 toDict["Error"] = getError(ex)
                 self.stateMachine.failed(self.dbI, toDict)
-                return toDict
             else:
                 toDict["State"] = "accepted"
                 self.stateMachine.accepting(self.dbI, toDict)

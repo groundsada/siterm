@@ -14,6 +14,10 @@ Unset means the system trust store and no client certificate, so a site that
 does not need any of this configures none of it.
 """
 
+# Optional packages are imported where they are used, not at module scope: that
+# deferral is what keeps them optional.
+# pylint: disable=import-outside-toplevel
+
 import os
 
 from SiteRMLibs.OtelAuth import getTokenSource
@@ -94,7 +98,7 @@ def tlsMaterial():
     return ca, cert, key
 
 
-class _AuthSession:
+class _AuthSession:  # pylint: disable=too-few-public-methods
     """requests.Session that stamps a fresh bearer token on every request.
 
     A static `headers` dict would pin the startup token and fail an hour later.
@@ -164,7 +168,7 @@ def _grpcCredentials(tokenSource, insecure):
     if not tokenSource.configured():
         return channel
 
-    class _Plugin(grpc.AuthMetadataPlugin):
+    class _Plugin(grpc.AuthMetadataPlugin):  # pylint: disable=too-few-public-methods
         """Supplies the Authorization header for each call."""
 
         def __call__(self, context, callback):
@@ -175,7 +179,7 @@ def _grpcCredentials(tokenSource, insecure):
     return grpc.composite_channel_credentials(channel, grpc.metadata_call_credentials(_Plugin()))
 
 
-def buildExporter(signal, endpoint, tokenSource=None):
+def buildExporter(signal, endpoint, tokenSource=None):  # pylint: disable=too-many-branches
     """OTLP exporter for `signal`, or None if the SDK pieces are missing.
 
     `signal` is one of traces, metrics, logs.
