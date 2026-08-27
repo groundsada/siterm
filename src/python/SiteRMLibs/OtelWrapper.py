@@ -21,6 +21,10 @@ Configuration is by environment variable, so the deployment decides where
 telemetry goes and SiteRM carries no backend knowledge.
 """
 
+# Optional packages are imported where they are used, not at module scope: that
+# deferral is what keeps them optional.
+# pylint: disable=import-outside-toplevel
+
 import os
 
 try:  # pragma: no cover - import guard is the point of this module
@@ -71,6 +75,9 @@ class _NoOpSpan:
     def set_attribute(self, *args, **kwargs):
         """No-op."""
 
+    def set_attributes(self, *args, **kwargs):
+        """No-op."""
+
     def set_status(self, *args, **kwargs):
         """No-op."""
 
@@ -79,6 +86,19 @@ class _NoOpSpan:
 
     def add_event(self, *args, **kwargs):
         """No-op."""
+
+    def add_link(self, *args, **kwargs):
+        """No-op."""
+
+    def update_name(self, *args, **kwargs):
+        """No-op."""
+
+    def end(self, *args, **kwargs):
+        """No-op."""
+
+    def is_recording(self):
+        """False, not None: callers branch on this."""
+        return False
 
     def get_span_context(self):
         """No-op."""

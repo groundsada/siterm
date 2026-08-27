@@ -108,6 +108,27 @@ class NoOpPathTestCase(unittest.TestCase):
             # setSpanStatus must tolerate the None the no-op path produces.
             wrapper.setSpanStatus(wrapper.getCurrentSpan(), wrapper.statusOk())
 
+    def testNoOpSpanCoversTheRealSpanApi(self):
+        """Any Span method a call site uses must exist on the no-op too.
+
+        Checked against the installed API rather than a hand-written list, so a
+        method added upstream shows up here instead of as an AttributeError at a
+        site with the packages uninstalled.
+        """
+        from opentelemetry.trace import Span  # pylint: disable=import-outside-toplevel
+
+        with _Hidden(["opentelemetry"], ["SiteRMLibs.OtelWrapper"]):
+            wrapper = importlib.import_module("SiteRMLibs.OtelWrapper")
+            noop = wrapper.getCurrentSpan()
+            missing = [name for name in dir(Span) if not name.startswith("_") and not hasattr(noop, name)]
+            self.assertEqual(missing, [], f"no-op span is missing {missing}")
+
+    def testNoOpSpanIsNotRecording(self):
+        """is_recording must be False, not None: call sites branch on it."""
+        with _Hidden(["opentelemetry"], ["SiteRMLibs.OtelWrapper"]):
+            wrapper = importlib.import_module("SiteRMLibs.OtelWrapper")
+            self.assertIs(wrapper.getCurrentSpan().is_recording(), False)
+
     def testEnabledStaysFalseEvenWhenAskedFor(self):
         """Enabling tracing without the packages must not raise."""
         with _Hidden(["opentelemetry"], ["SiteRMLibs.OtelWrapper"]):
@@ -368,12 +389,13 @@ class TraceCorrelationTestCase(unittest.TestCase):
         module = importlib.import_module("SiteRMLibs.OpenTelemetry")
         if not module.OTEL_SDK_AVAILABLE:
             self.skipTest("opentelemetry sdk not installed")
-        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace import TracerProvider  # pylint: disable=import-outside-toplevel
 
         provider = TracerProvider()
         tracer = provider.get_tracer("test")
         formatter = self.utils.buildFormatter()
-        with tracer.start_as_current_span("poll") as span:
+        # pylint cannot see through the SDK's contextmanager decorator.
+        with tracer.start_as_current_span("poll") as span:  # pylint: disable=not-context-manager
             ids = self.wrapper.traceIds()
             self.assertIsNotNone(ids)
             self.assertEqual(ids[0], f"{span.get_span_context().trace_id:032x}")
