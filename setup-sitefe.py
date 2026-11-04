@@ -52,5 +52,6 @@ setup(
     py_modules=get_py_modules(["src/python/SiteFE/", "src/python/SiteRMLibs"]),
     scripts=SCRIPTS,
     include_package_data=True,
+    package_data={"SiteRMLibs": ["ArchifyDrawio.js"]},
     data_files=collect_files("release/", "/SiteFE/release"),
 )

@@ -72,13 +72,82 @@ SPEED_COLOURS = {
 # Service states by severity; anything else a service reports counts as UNKNOWN. FE services report as host "default".
 STATES = ("OK", "UNKNOWN", "WARNING", "FAILED")
 STATE_ALIASES = {"KEYBOARDINTERRUPT": "FAILED"}
-STATE_COLOURS = {"OK": "#0ca30c", "UNKNOWN": "#898781", "WARNING": "#fab219", "FAILED": "#d03b3b"}
+# Bootstrap 4.6 contextual colours, as the rest of the SiteRM UI uses them (warning is btn-warning's border, readable on white).
+STATE_COLOURS = {"OK": "#28a745", "UNKNOWN": "#6c757d", "WARNING": "#d39e00", "FAILED": "#dc3545"}
 STATE_DOTS = {"OK": "emerald", "UNKNOWN": "slate", "WARNING": "amber", "FAILED": "rose"}
 STATE_LEGEND = {"OK": "OK", "UNKNOWN": "UNKNOWN (no recent report)", "WARNING": "WARNING", "FAILED": "FAILED"}
 FRONTEND_HOST = "default"
 NO_EXCEPTION = "No Exception provided by service"
 SPEED_CARD = "Link speed"
 HEALTH_CARD = "Node health"
+
+# Archify's own palette is a navy dark theme; the page lives inside the SiteRM UI, so it gets the UI's Bootstrap 4.6 palette and font instead.
+# Light is the default (SiteRM has no dark mode); dark (the viewer's theme toggle, and the script-less ?view=graph embed) uses Bootstrap's greys.
+# Component kinds: messagebus = switch, backend = server, cloud = WAN peer; the rest keep a Bootstrap colour in case Archify draws them.
+UI_FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "Liberation Sans", sans-serif'
+UI_THEMES = {
+    "light": {
+        "base": "#ffffff",
+        "tint": 0.1,
+        "vars": {
+            "bg": "#ffffff",
+            "panel": "#ffffff",
+            "mask": "#ffffff",
+            "grid": "#e9ecef",
+            "canvas-dot": "#e3e6ea",
+            "text": "#212529",
+            "text-muted": "#6c757d",
+            "text-dim": "#adb5bd",
+            "text-faint": "#6c757d",
+            "panel-border": "#dee2e6",
+            "lane-fill": "#f8f9fa",
+            "lane-stroke": "#ced4da",
+            "arrow": "#6c757d",
+            "arrow-emphasis": "#007bff",
+            "toolbar-bg": "#ffffff",
+            "toolbar-border": "#dee2e6",
+            "toolbar-text": "#495057",
+            "toolbar-hover": "#f8f9fa",
+            "toolbar-menu-bg": "#ffffff",
+            "guide-accent": "#007bff",
+            "lens-color": "#007bff",
+            "reach-color": "#007bff",
+            "reach-fill": "rgba(0, 123, 255, 0.12)",
+        },
+        "kinds": {"messagebus": "#007bff", "backend": "#6c757d", "cloud": "#138496", "frontend": "#138496", "database": "#6f42c1", "security": "#dc3545", "external": "#6c757d"},
+    },
+    "dark": {
+        "base": "#2b3035",
+        "tint": 0.16,
+        "vars": {
+            "bg": "#212529",
+            "panel": "#212529",
+            "mask": "#2b3035",
+            "grid": "#343a40",
+            "canvas-dot": "#343a40",
+            "text": "#f8f9fa",
+            "text-muted": "#adb5bd",
+            "text-dim": "#6c757d",
+            "text-faint": "#adb5bd",
+            "panel-border": "#495057",
+            "lane-fill": "#2b3035",
+            "lane-stroke": "#495057",
+            "arrow": "#adb5bd",
+            "arrow-emphasis": "#6ea8fe",
+            "toolbar-bg": "#2b3035",
+            "toolbar-border": "#495057",
+            "toolbar-text": "#dee2e6",
+            "toolbar-hover": "#343a40",
+            "toolbar-menu-bg": "#2b3035",
+            "guide-accent": "#6ea8fe",
+            "lens-color": "#6ea8fe",
+            "reach-color": "#6ea8fe",
+            "reach-fill": "rgba(110, 168, 254, 0.16)",
+        },
+        "kinds": {"messagebus": "#6ea8fe", "backend": "#adb5bd", "cloud": "#6edff6", "frontend": "#6edff6", "database": "#a98eda", "security": "#ea868f", "external": "#adb5bd"},
+    },
+}
+DRAWIO_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ArchifyDrawio.js")
 
 _CACHE = OrderedDict()
 _CACHE_LOCK = threading.Lock()
@@ -606,16 +675,64 @@ def buildDiagram(topology, sitename, filters=None, health=None, cards=True):
     if cards:
         extras = {"health": _healthCards(model["states"], health) if health is not None else [], "path": filters.get("path")}
         archIR["cards"] = _cards(topology, model["tiers"], model["pairs"], extras)
-    return {"ir": archIR, "edges": edges, "marks": _healthMarks(ids, drawing["layout"], model["states"])}
+    # The graph-only view is embedded in Grafana, which serves it without scripts, so it opens dark there.
+    return {"ir": archIR, "edges": edges, "marks": _healthMarks(ids, drawing["layout"], model["states"]), "theme": "light" if cards else "dark"}
+
+
+def _mix(colour, base, amount):
+    """Return colour blended into base by amount (0..1), as hex: the opaque tint a box is filled with."""
+    rgb = [int(colour[idx : idx + 2], 16) * amount + int(base[idx : idx + 2], 16) * (1 - amount) for idx in (1, 3, 5)]
+    return "#" + "".join(f"{round(val):02x}" for val in rgb)
+
+
+def _themeStyles():
+    """Return the CSS that puts Archify's theme variables, fonts and frames on the SiteRM palette.
+
+    Selectors are [data-theme=...] without html so Archify's own SVG/PNG export, which resolves the variables on a probe element, picks them up too.
+    """
+    rules = []
+    for name, selector in (("dark", ":root, [data-theme='dark']"), ("light", "[data-theme='light']")):
+        theme = UI_THEMES[name]
+        values = dict(theme["vars"])
+        for kind, colour in theme["kinds"].items():
+            values[f"{kind}-stroke"] = colour
+            values[f"{kind}-fill"] = _mix(colour, theme["base"], theme["tint"])
+        rules.append(f"{selector} {{ " + " ".join(f"--{key}: {val};" for key, val in values.items()) + " }")
+    rules += [
+        f"body, .toolbar, .cards, .diagram-container svg text {{ font-family: {UI_FONT}; }}",
+        ".diagram-container svg .c-region { fill: var(--lane-fill); stroke: var(--lane-stroke); }",
+        "html[data-theme] .diagram-container svg [data-node-id] > rect:not(.c-mask) { filter: none; }",
+    ]
+    return rules
+
+
+# Runs in <head> and again after the viewer's own script: the page opens in the host theme unless the URL or a saved choice says otherwise.
+_THEME_SCRIPT = """<script>(function () {
+  var want = %s, root = document.documentElement, chosen = false;
+  try { chosen = /[?&]theme=(light|dark)/.test(location.search) || !!localStorage.getItem('archify-theme'); } catch (_) {}
+  if (chosen || root.getAttribute('data-theme') === want) return;
+  var toggle = document.getElementById('btn-theme');
+  if (toggle && window.Archify && Archify.theme) toggle.click(); else root.setAttribute('data-theme', want);
+})();</script>
+"""
+
+
+def _drawioScript():
+    """Return the draw.io export script as an inline <script>, or "" if the file is missing (the diagram still works without it)."""
+    try:
+        with open(DRAWIO_SCRIPT, "r", encoding="utf-8") as fd:
+            return "<script>\n" + fd.read().replace("</script", "<\\/script") + "\n</script>\n"
+    except OSError:
+        return ""
 
 
 def _styles(diagram):
-    """Return the CSS for link speeds, port-channel rings, off-path links, health marks and legend swatches."""
+    """Return the CSS for the SiteRM palette, link speeds, port-channel rings, off-path links, health marks and legend swatches."""
     dark = " ".join(f"--st-{cls}: {colours[1]};" for cls, colours in SPEED_COLOURS.items())
     light = " ".join(f"--st-{cls}: {colours[0]};" for cls, colours in SPEED_COLOURS.items())
-    rules = [
-        f":root, html[data-theme='dark'] {{ {dark} }}",
-        f"html[data-theme='light'] {{ {light} }}",
+    rules = _themeStyles() + [
+        f":root, [data-theme='dark'] {{ {dark} }}",
+        f"[data-theme='light'] {{ {light} }}",
         "svg .st-link { fill: none; stroke-linecap: round; stroke-linejoin: round; }",
         "svg .st-sunknown { stroke: var(--text-dim); stroke-dasharray: 4 3; }",
         f"svg .st-{DOWN_LINK[0]} {{ stroke: {STATE_COLOURS['FAILED']}; stroke-dasharray: 1 5; }}",
@@ -683,7 +800,10 @@ def _decorate(page, diagram):
     svgEnd = page.find("</svg>", svgStart) if svgStart >= 0 else -1
     if marks and svgEnd >= 0:
         page = f'{page[:svgEnd]}<g data-siterm-health="">{marks}</g>{page[svgEnd:]}'
-    return page.replace("</head>", _styles(diagram) + "</head>", 1)
+    theme = _THEME_SCRIPT % json.dumps(diagram.get("theme", "light"))
+    page = re.sub(r'(<html\b[^>]*\sdata-theme=")[a-z]+(")', lambda match: match.group(1) + diagram.get("theme", "light") + match.group(2), page, count=1)
+    page = page.replace("</head>", _styles(diagram) + theme + "</head>", 1)
+    return page.replace("</body>", theme + _drawioScript() + "</body>", 1) if "</body>" in page else page + theme + _drawioScript()
 
 
 def _renderUncached(ir, timeout):
